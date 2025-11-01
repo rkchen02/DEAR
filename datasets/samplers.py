@@ -11,6 +11,7 @@ from clrs._src.samplers import (
 
 class RNGMatcherSampler(Sampler):
     """String matching sampler; embeds needle in a random haystack."""
+    CAN_TRUNCATE_INPUT_DATA = False
 
     def _sample_data(
         self,
@@ -35,6 +36,7 @@ class RNGMatcherSampler(Sampler):
 
 class BetterMatcherSampler(Sampler):
     """String matching sampler; embeds needle in a random haystack."""
+    CAN_TRUNCATE_INPUT_DATA = False
 
     def _sample_data(
         self,
@@ -60,6 +62,7 @@ class BetterMatcherSampler(Sampler):
 
 class BetterSearchSampler(Sampler):
     """Search sampler. Generates a random sequence and target (of U[0, 1])."""
+    CAN_TRUNCATE_INPUT_DATA = False
 
     def _sample_data(
         self,

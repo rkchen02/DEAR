@@ -5,6 +5,7 @@ from clrs._src.specs import SPECS
 
 class GeometricGraphSampler(Sampler):
     """Bellman-Ford sampler."""
+    CAN_TRUNCATE_INPUT_DATA = False
 
     def _sample_data(
         self,

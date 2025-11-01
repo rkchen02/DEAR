@@ -159,14 +159,17 @@ class DEQReasoner(AlgorithmReasoner):
         )
         hidden = z_out[-1][0]
         hiddentoret = hidden.clone()
-        trajectory = info["trajectory"]
-        trajectory = [
-            traj[:, : hidden.shape[1] * hidden.shape[2]].view(
-                traj.shape[0], -1, self.latent_features
-            )
-            for traj in trajectory
-        ]  # List[B x Nmax x H]
-        trajectory = torch.stack(trajectory, dim=0)
+        trajectory = info.get("trajectory", None)
+
+        if trajectory is not None:
+            trajectory = [
+                traj[:, : hidden.shape[1] * hidden.shape[2]].view(
+                    traj.shape[0], -1, self.latent_features
+                )
+                for traj in trajectory
+            ]  # List[B x Nmax x H]
+            trajectory = torch.stack(trajectory, dim=0)
+
         edge_fts_decode = edge_fts
         self.extra_outs = []
         if self.config["deq"].get("stochastic", False) and self.training:
