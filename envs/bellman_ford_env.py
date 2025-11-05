@@ -54,9 +54,9 @@ class BellmanFordEnv(gym.Env):
 
     def _get_obs(self):
         return {
-            "d": self.d.copy(),
-            "pi": self.pi.copy(),
-            "w": self.w.copy(),
+            "d": np.nan_to_num(self.d.copy(), nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32),
+            "pi": self.pi.copy().astype(np.int32),
+            "w": np.nan_to_num(self.w.copy(), nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32),
         }
 
     def reset(self, seed=None, options=None):
