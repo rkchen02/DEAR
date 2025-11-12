@@ -16,21 +16,29 @@ def main():
 
     print("Evaluating trained Bellman-Ford agent...\n")
 
-    for step in range(15):
+    for step in range(50):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, _, _ = env.step(action)
+        if isinstance(action, (list, tuple, np.ndarray)):
+            action = int(np.asarray(action).item())
+        obs, reward, done, _, info = env.step(action)
         total_reward += reward
+        u, v = env.edges[action]
 
         print(f"--- Step {step + 1} ---")
-        print(f"Action chosen: {action}")
+        print(f"Action chosen: index={action} -> (u={u}, v={v})")
         print(f"Reward: {reward}")
-        print(f"Distances: {np.round(obs['d'], 3)}\n")
+        print(f"Distances: {np.round(obs['d'], 3)}")
+        print("Info:", info)
+        print()
 
         if done:
-            print("Episode finished early.")
+            print("Episode finished early. Reason:", info.get("reason"))
             break
 
     print(f"Total reward collected: {total_reward:.2f}")
+
+    metrics = env.compute_metrics()
+    print("Final metrics:", metrics)
     env.close()
 
 
