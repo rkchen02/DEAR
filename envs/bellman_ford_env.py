@@ -1,268 +1,464 @@
-import numpy as np
+import os
+import warnings
+from typing import Any, Dict, Optional, Tuple
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-def compute_ground_truth(A: np.ndarray, s: int):
-    """Compute Bellman–Ford ground truth distances and predecessors (CLRS-style).
-
-    This is adapted from clrs/_src/algorithms/graphs.py: bellman_ford(),
-    but stripped of probing, chex, and TensorFlow dependencies.
-    """
-    n = A.shape[0]
-    d = np.full(n, np.inf, dtype=np.float32)
-    pi = np.full(n, -1, dtype=np.int32)
-    mask = np.zeros(n, dtype=np.bool_)
-
-    d[s] = 0.0
-    mask[s] = True
-
-    while True:
-        prev_d = d.copy()
-        prev_mask = mask.copy()
-
-        for u in range(n):
-            if not prev_mask[u]:
-                continue
-            for v in range(n):
-                if A[u, v] != 0:
-                    if not mask[v] or prev_d[u] + A[u, v] < d[v]:
-                        d[v] = prev_d[u] + A[u, v]
-                        pi[v] = u
-                    mask[v] = True
-
-        if np.allclose(d, prev_d):
-            break
-
-    return d, pi
-
 
 class BellmanFordEnv(gym.Env):
     """
-    Bellman-Ford shortest-path algorithm framed as an MDP.
-    Uses CLRS dataset graphs.
+    Bellman–Ford environment for RL.
+
+    Optionally draws graphs from the CLRS / DEAR generators
+    (via the PyTorch Geometric dataset defined in datasets/clrs_datasets.py).
+
+    Key points:
+    - State is the current distance estimates d, predecessors pi and a visited mask.
+    - Action is choosing a directed edge (u, v) to relax.
+    - Transition follows the usual Bellman–Ford relaxation rule.
+    - Episode length follows the classical CLRS Bellman–Ford structure:
+        horizon = (|V| - 1) * |E|
+      i.e. we perform up to |V| - 1 passes over all edges; no early stopping
+      when there are no more improvements.
     """
 
-    metadata = {"render.modes": []}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, n_nodes=5, max_steps=None, reward_mode="dense", seed=None, safe_mode=True):
+    def __init__(
+        self,
+        n_nodes: int,
+        reward_mode: str = "dense",
+        seed: Optional[int] = None,
+        use_clrs: bool = True,
+        clrs_root: Optional[str] = None,
+        clrs_num_samples: int = 10_000,
+        clrs_split: str = "train",
+        clrs_sampler_type: str = "normal",
+        clrs_randomise_pos: bool = True,
+        allow_negative_weights: bool = True,
+        min_weight: float = -1.0,
+        max_weight: float = 1.0,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        n_nodes : int
+            Number of nodes in the graph. For CLRS graphs this must match the
+            `num_nodes` argument used when creating the CLRS dataset.
+        reward_mode : {"dense", "sparse"}
+            Dense: +1 for every successful relaxation, 0 otherwise.
+            Sparse: currently behaves the same as dense (can change shaping).
+        seed : int, optional
+            Random seed.
+        use_clrs : bool
+            If True, try to use the CLRS / DEAR graph generator
+            (datasets.clrs_datasets.CLRS with algorithm="bellman_ford").
+            If this import / construction fails, fall back to random graphs.
+        clrs_root : str, optional
+            Root directory for CLRS data. If None, defaults to
+            "<repo_root>/data/clrs".
+        clrs_num_samples : int
+            Number of CLRS samples to pre-generate in the underlying dataset.
+        clrs_split : str
+            Split to use for CLRS ("train", "val", "test", ...).
+        clrs_sampler_type : str
+            Sampler type passed through to CLRS (e.g. "normal").
+        clrs_randomise_pos : bool
+            Whether to randomise node positions in CLRS graphs.
+        allow_negative_weights : bool
+            Whether edges may have negative weights (no negative cycles).
+        min_weight, max_weight : float
+            Range for random weights when not using CLRS.
+        """
         super().__init__()
-        self.n_nodes = n_nodes
-        self.max_nodes = 12
-        self.max_steps = max_steps if max_steps is not None else n_nodes * (n_nodes - 1)
+
+        assert reward_mode in ("dense", "sparse")
+        self.n_nodes = int(n_nodes)
         self.reward_mode = reward_mode
-        self.safe_mode = safe_mode
-        self.dataset = None
-        self.sampler = None
+        self.rng = np.random.RandomState(seed)
+        self.allow_negative_weights = allow_negative_weights
+        self.min_weight = min_weight
+        self.max_weight = max_weight
 
-        self.action_space = spaces.MultiDiscrete([n_nodes, n_nodes])
-        self.observation_space = spaces.Dict({
-            "d": spaces.Box(low=-np.inf, high=np.inf, shape=(self.max_nodes,), dtype=np.float32),
-            "pi": spaces.Box(low=-1, high=self.max_nodes - 1, shape=(self.max_nodes,), dtype=np.int32),
-            "w": spaces.Box(low=-1.0, high=1.0, shape=(self.max_nodes, self.max_nodes), dtype=np.float32),
-        })
+        # --- CLRS integration -------------------------------------------------
+        self.use_clrs = use_clrs
+        self._clrs_dataset = None
+        self._clrs_idx = 0
 
-        self.np_random, _ = gym.utils.seeding.np_random(seed)
+        if self.use_clrs:
+            try:
+                # Lazy import so that this file can still be used without CLRS.
+                from datasets.clrs_datasets import CLRS as CLRSData  # type: ignore
 
-    def _init_graph(self):
-        """Initialise graph using CLRS dataset for Bellman-Ford, safe for CLRS."""
-        import traceback
-        import numpy as np
-        from clrs import create_dataset
+                if clrs_root is None:
+                    # Assume this file lives at <repo_root>/envs/bellman_ford_env.py
+                    repo_root = os.path.abspath(
+                        os.path.join(os.path.dirname(__file__), os.pardir)
+                    )
+                    clrs_root = os.path.join(repo_root, "data", "clrs")
 
-        try:
-            # Create dataset iterator once
-            if not hasattr(self, "dataset_iterator"):
-                ds, spec, _ = create_dataset(
-                    folder="./data/tmp/",
+                self._clrs_dataset = CLRSData(
+                    root=clrs_root,
+                    num_nodes=self.n_nodes,
+                    num_samples=clrs_num_samples,
                     algorithm="bellman_ford",
-                    batch_size=1,
-                    split="train",
+                    split=clrs_split,
+                    sampler_type=clrs_sampler_type,
+                    randomise_pos=clrs_randomise_pos,
+                    seed=seed if seed is not None else 0,
                 )
-                self.dataset_iterator = ds.as_numpy_iterator()
+                if len(self._clrs_dataset) == 0:
+                    warnings.warn(
+                        "CLRS dataset for bellman_ford is empty; "
+                        "falling back to random graphs."
+                    )
+                    self._clrs_dataset = None
+                    self.use_clrs = False
+            except Exception as e:  # pragma: no cover - defensive
+                warnings.warn(
+                    f"Could not construct CLRS bellman_ford dataset "
+                    f"(error: {e!r}); falling back to random graphs.\n"
+                    "If you want CLRS graphs, make sure that "
+                    "datasets/clrs_datasets.py is on the Python path and that "
+                    "prepare_datasets.py has been run for bellman_ford."
+                )
+                self._clrs_dataset = None
+                self.use_clrs = False
 
-            feedback = next(self.dataset_iterator)
+        # --- Gym spaces -------------------------------------------------------
+        # Action: choose a directed edge (u, v).
+        self.action_space = spaces.MultiDiscrete([self.n_nodes, self.n_nodes])
 
-            # Extract adjacency matrix (A or adj)
-            A = None
-            for inp in feedback.features.inputs:
-                if inp.name in ("A", "adj"):
-                    A = np.array(inp.data[0])  # (1, N, N) → take [0]
-                    break
-            if A is None:
-                raise ValueError("No adjacency matrix found in CLRS Bellman-Ford sample")
+        # Observation: dict of numpy arrays.
+        self.observation_space = spaces.Dict(
+            {
+                "t": spaces.Box(
+                    low=0,
+                    high=np.iinfo(np.int32).max,
+                    shape=(),
+                    dtype=np.int32,
+                ),
+                "p": spaces.Discrete(2),  # phase; currently always 1
+                "source": spaces.Discrete(self.n_nodes),
+                "d": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.n_nodes,),
+                    dtype=np.float32,
+                ),
+                "visited": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(self.n_nodes,),
+                    dtype=np.float32,
+                ),
+                "pred": spaces.Box(
+                    low=-1,
+                    high=self.n_nodes - 1,
+                    shape=(self.n_nodes,),
+                    dtype=np.int32,
+                ),
+            }
+        )
 
-            A = np.array(A, dtype=np.float32)
-            np.fill_diagonal(A, 0.0)
-            self.w = A
-            self.n_nodes = A.shape[0]
+        # Internal state placeholders (initialised in reset()).
+        self.W: Optional[np.ndarray] = None  # weight matrix [n, n], inf if no edge
+        self.edge_list = []  # list of (u, v) with an edge
+        self.source: int = 0
+        self.d: np.ndarray = np.zeros(self.n_nodes, dtype=np.float32)
+        self.pred: np.ndarray = -np.ones(self.n_nodes, dtype=np.int32)
+        self.visited: np.ndarray = np.zeros(self.n_nodes, dtype=np.float32)
+        self.t: int = 0
+        self.phase: int = 1
+        self.max_steps: int = 0  # set after we know |E|
+        self.opt_d: Optional[np.ndarray] = None
+        self.opt_pred: Optional[np.ndarray] = None
+        self.has_neg_cycle: bool = False
 
-            # Extract predecessor pointers (pi)
-            gt_pi = None
-            for out in feedback.outputs:
-                if out.name.lower() in ("pi", "predecessor", "predecessors", "parents"):
-                    gt_pi = np.array(out.data[0], dtype=np.int32)
-                    break
-
-            # Ground truth distances are not provided by CLRS → compute manually
-            self.gt_pi = gt_pi if gt_pi is not None else np.full(self.n_nodes, -1, dtype=np.int32)
-            self._compute_ground_truth()
-
-            # Pad to max_nodes
-            if self.n_nodes < self.max_nodes:
-                pad = self.max_nodes - self.n_nodes
-                self.w = np.pad(self.w, ((0, pad), (0, pad)), constant_values=0.0)
-
-        except Exception as e:
-            print("Warning: CLRS sample failed, falling back to random graph.")
-            print("Reason:", repr(e))
-            traceback.print_exc()
-            w = self.np_random.uniform(-1.0, 1.0, (self.n_nodes, self.n_nodes)).astype(np.float32)
-            np.fill_diagonal(w, 0.0)
-            if self.n_nodes < self.max_nodes:
-                pad = self.max_nodes - self.n_nodes
-                w = np.pad(w, ((0, pad), (0, pad)), constant_values=0.0)
-            self.w = w
-            self._compute_ground_truth()
-
-        self.gt_d, self.gt_pi_ref = compute_ground_truth(self.w, s=0)
-
-    def _get_obs(self):
-        d = np.nan_to_num(self.d.copy(), nan=0.0, posinf=1e6, neginf=-1e6)
-        pi = self.pi.copy()
-
-        if len(d) < self.max_nodes:
-            pad = self.max_nodes - len(d)
-            d = np.pad(d, (0, pad), constant_values=0.0)
-            pi = np.pad(pi, (0, pad), constant_values=-1)
-
+    # ------------------------------------------------------------------ utils
+    def _empty_obs(self) -> Dict[str, Any]:
         return {
-            "d": d.astype(np.float32),
-            "pi": pi.astype(np.int32),
-            "w": np.nan_to_num(self.w.copy(), nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32),
+            "t": np.array(0, dtype=np.int32),
+            "p": np.array(1, dtype=np.int32),
+            "source": np.array(0, dtype=np.int32),
+            "d": np.full(self.n_nodes, np.inf, dtype=np.float32),
+            "visited": np.zeros(self.n_nodes, dtype=np.float32),
+            "pred": np.full(self.n_nodes, -1, dtype=np.int32),
         }
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self._init_graph()
+    def _graph_from_clrs_sample(self) -> Tuple[np.ndarray, int]:
+        """Get a graph from the CLRS dataset and convert it to (W, n)."""
+        assert self._clrs_dataset is not None
+        idx = self._clrs_idx
+        self._clrs_idx = (self._clrs_idx + 1) % len(self._clrs_dataset)
 
-        self.src = 0
-        self.d = np.full(self.n_nodes, np.inf, dtype=np.float32)
-        self.d[self.src] = 0.0
-        self.pi = np.full(self.n_nodes, -1, dtype=np.int32)
+        data = self._clrs_dataset[idx]
 
-        self.steps = 0
-        self.relax_passes = 0
-        self.updated_in_pass = False
-        self.done_flag = False
+        # Expected fields from datasets/clrs_datasets.py:
+        # - data.num_nodes : int
+        # - data.edge_index : LongTensor [2, E]
+        # - data.A : FloatTensor [E] or [E, 1] with edge weights
+        num_nodes = int(data.num_nodes)
+        edge_index = data.edge_index.cpu().numpy()
+        edge_attr = data.A
+        edge_attr = edge_attr.view(-1).cpu().numpy().astype(np.float32)
 
-        return self._get_obs(), {}
+        W = np.full((num_nodes, num_nodes), np.inf, dtype=np.float32)
+        for (u, v), w in zip(edge_index.T, edge_attr):
+            W[int(u), int(v)] = float(w)
 
-    def step(self, action):
-        if self.done_flag:
-            raise RuntimeError("Episode is done. Call reset() before step().")
+        return W, num_nodes
 
-        u, v = int(action[0]), int(action[1])
-        u = np.clip(u, 0, self.n_nodes - 1)
-        v = np.clip(v, 0, self.n_nodes - 1)
-        self.steps += 1
-
-        reward = 0.0
-        improved = False
-
-        if np.isfinite(self.d[u]):
-            new_dv = self.d[u] + self.w[u, v]
-            if new_dv < self.d[v]:
-                self.d[v] = new_dv
-                self.pi[v] = u
-                improved = True
-                if self.reward_mode == "dense":
-                    reward = 1.0  # reward for successful relaxation
-
-        # Track whether any improvement happened in this pass
-        self.updated_in_pass = self.updated_in_pass or improved
-
-        # Count steps within the current relaxation pass
-        self.steps_in_pass = getattr(self, "steps_in_pass", 0) + 1
-        edges_per_pass = self.n_nodes * (self.n_nodes - 1)
-
-        # After one full pass through all possible edges
-        if self.steps_in_pass >= edges_per_pass:
-            self.relax_passes += 1
-            if not self.updated_in_pass:
-                # No updates → converged early
-                self.done_flag = True
-                info_reason = "converged"
-            elif self.relax_passes >= (self.n_nodes - 1):
-                # Completed n-1 passes → stop
-                self.done_flag = True
-                info_reason = "max_passes"
-            else:
-                # Continue another pass
-                info_reason = "next_pass"
-
-            # Reset per-pass tracking
-            self.steps_in_pass = 0
-            self.updated_in_pass = False
-        else:
-            info_reason = "running"
-
-        done = self.done_flag or self.steps >= self.max_steps
-        obs = self._get_obs()
-        info = {"reason": info_reason}
-
-        return obs, reward, done, False, info
-
-    def compute_metrics(self):
-        gt_d, gt_pi, d = self.gt_d, self.gt_pi, self.d
-        tol = 1e-4
-
-        dist_match = np.zeros(self.n_nodes, dtype=bool)
-        for i in range(self.n_nodes):
-            if np.isinf(gt_d[i]) and np.isinf(d[i]):
-                dist_match[i] = True
-            elif np.isfinite(gt_d[i]) and np.isfinite(d[i]):
-                dist_match[i] = np.isclose(gt_d[i], d[i], atol=tol)
-
-        pointer_match = (self.pi == gt_pi)
-
-        return {
-            "distance_accuracy": float(dist_match.mean()),
-            "pointer_accuracy": float(pointer_match.mean()),
-            "distance_match_vector": dist_match,
-            "pointer_match_vector": pointer_match,
-        }
-    
-    def _compute_ground_truth(self):
-        """Compute ground truth shortest distances and predecessors via classical Bellman-Ford."""
+    def _graph_random(self) -> Tuple[np.ndarray, int]:
+        """Fallback random graph generator (Erdos–Rényi style)."""
         n = self.n_nodes
-        src = 0
-        dist = np.full(n, np.inf, dtype=np.float32)
-        pred = np.full(n, -1, dtype=np.int32)
-        dist[src] = 0.0
+        W = np.full((n, n), np.inf, dtype=np.float32)
 
-        # Relax edges up to n - 1 times
+        p_edge = 0.5
+        for u in range(n):
+            for v in range(n):
+                if u == v:
+                    continue
+                if self.rng.rand() < p_edge:
+                    if self.allow_negative_weights:
+                        w = self.rng.uniform(self.min_weight, self.max_weight)
+                    else:
+                        w = self.rng.uniform(0.0, self.max_weight)
+                    W[u, v] = float(w)
+
+        # Ensure at least some edges.
+        if not np.any(np.isfinite(W)):
+            for u in range(n - 1):
+                W[u, u + 1] = self.rng.uniform(
+                    0.0 if not self.allow_negative_weights else self.min_weight,
+                    self.max_weight,
+                )
+
+        return W, n
+
+    def _build_edge_list(self) -> None:
+        assert self.W is not None
+        self.edge_list = [
+            (int(u), int(v))
+            for u in range(self.n_nodes)
+            for v in range(self.n_nodes)
+            if np.isfinite(self.W[u, v])
+        ]
+
+    def _bellman_ford_ground_truth(
+        self, source: int
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        """Classical Bellman–Ford run used for targets / metrics."""
+        n = self.n_nodes
+        d = np.full(n, np.inf, dtype=np.float32)
+        pred = -np.ones(n, dtype=np.int32)
+        d[source] = 0.0
+
+        # |V| - 1 relaxation passes.
         for _ in range(n - 1):
-            updated = False
-            for u in range(n):
-                if not np.isfinite(dist[u]):
-                    continue  # skip unreachable nodes
-                for v in range(n):
-                    new_dist = dist[u] + self.w[u, v]
-                    if new_dist < dist[v]:
-                        dist[v] = new_dist
-                        pred[v] = u
-                        updated = True
-            if not updated:
+            for u, v in self.edge_list:
+                w = self.W[u, v]
+                if not np.isfinite(w):
+                    continue
+                if not np.isfinite(d[u]):
+                    continue
+                new_d = d[u] + w
+                if new_d < d[v]:
+                    d[v] = new_d
+                    pred[v] = u
+
+        # Negative cycle detection.
+        has_neg_cycle = False
+        for u, v in self.edge_list:
+            w = self.W[u, v]
+            if not np.isfinite(w):
+                continue
+            if not np.isfinite(d[u]):
+                continue
+            if d[u] + w < d[v]:
+                has_neg_cycle = True
                 break
 
-        self.gt_d = dist
-        self.gt_pi = pred
+        return d, pred, has_neg_cycle
 
+    def _get_obs(self) -> Dict[str, Any]:
+        return {
+            "t": np.array(self.t, dtype=np.int32),
+            "p": np.array(self.phase, dtype=np.int32),
+            "source": np.array(self.source, dtype=np.int32),
+            "d": self.d.copy(),
+            "visited": self.visited.copy(),
+            "pred": self.pred.copy(),
+        }
+
+    # ----------------------------------------------------------------- Env API
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ):
+        super().reset(seed=seed)
+        if seed is not None:
+            self.rng.seed(seed)
+
+        # Sample graph (CLRS if available, else random).
+        if self.use_clrs and self._clrs_dataset is not None:
+            self.W, self.n_nodes = self._graph_from_clrs_sample()
+        else:
+            self.W, self.n_nodes = self._graph_random()
+
+        # Build edge list & classical BF ground truth.
+        self._build_edge_list()
+        num_edges = len(self.edge_list)
+        if num_edges == 0:
+            raise RuntimeError("Graph has no edges; this should not happen.")
+
+        # Horizon matches classical CLRS Bellman–Ford: (|V| - 1) * |E|.
+        self.max_steps = (self.n_nodes - 1) * num_edges
+
+        # Sample a source node.
+        self.source = int(self.rng.randint(self.n_nodes))
+
+        # Initialise distances / predecessors.
+        self.d = np.full(self.n_nodes, np.inf, dtype=np.float32)
+        self.pred = np.full(self.n_nodes, -1, dtype=np.int32)
+        self.visited = np.zeros(self.n_nodes, dtype=np.float32)
+        self.d[self.source] = 0.0
+        self.visited[self.source] = 1.0
+
+        self.t = 0
+        self.phase = 1
+
+        # Ground-truth Bellman–Ford solution for metrics / shaping.
+        self.opt_d, self.opt_pred, self.has_neg_cycle = self._bellman_ford_ground_truth(
+            self.source
+        )
+
+        obs = self._get_obs()
+        info: Dict[str, Any] = {}
+        return obs, info
+
+    def step(self, action):
+        """
+        Perform one Bellman–Ford relaxation step on edge (u, v) chosen by the agent.
+        """
+        if isinstance(action, (list, tuple, np.ndarray)):
+            u, v = int(action[0]), int(action[1])
+        else:
+            try:
+                u, v = map(int, action)
+            except TypeError:
+                raise ValueError(f"Unexpected action format: {action!r}")
+
+        reward = 0.0
+
+        # Invalid actions get a small penalty.
+        if not (0 <= u < self.n_nodes and 0 <= v < self.n_nodes):
+            reward = -1.0
+        else:
+            w = self.W[u, v]
+            if np.isfinite(w) and np.isfinite(self.d[u]):
+                new_d = self.d[u] + w
+                if new_d < self.d[v]:
+                    # Successful relaxation.
+                    self.d[v] = new_d
+                    self.pred[v] = u
+                    self.visited[v] = 1.0
+                    if self.reward_mode == "dense":
+                        reward = 1.0
+                else:
+                    # No improvement on this edge.
+                    if self.reward_mode == "dense":
+                        reward = 0.0
+            else:
+                # Relaxing a non-edge or from an unreachable node.
+                if self.reward_mode == "dense":
+                    reward = 0.0
+
+        self.t += 1
+
+        terminated = False
+        truncated = False
+
+        if self.t >= self.max_steps:
+            terminated = True
+
+        obs = self._get_obs()
+        info: Dict[str, Any] = {}
+        return obs, float(reward), terminated, truncated, info
+
+    # ------------------------------------------------------------- diagnostics
+    def compute_metrics(self) -> Dict[str, float]:
+        """
+        Compare current distances / preds to the classical Bellman–Ford solution.
+        """
+        if self.opt_d is None or self.opt_pred is None:
+            return {}
+
+        dist_error = float(
+            np.nanmean(
+                np.where(
+                    np.isfinite(self.opt_d),
+                    np.abs(self.d - self.opt_d),
+                    0.0,
+                )
+            )
+        )
+        pred_accuracy = float(np.mean(self.pred == self.opt_pred))
+
+        return {
+            "dist_error": dist_error,
+            "pred_accuracy": pred_accuracy,
+            "has_neg_cycle": float(self.has_neg_cycle),
+        }
 
     def render(self):
-        print("\nEdge weights:\n", np.round(self.w[:self.n_nodes, :self.n_nodes], 3))
-        print("Current distances:", np.round(self.d, 3))
-        print("Predecessors:", self.pi)
-        print("Ground truth distances:", np.round(self.gt_d, 3))
-        print("Ground truth preds:", self.gt_pi)
+        """Pretty-print the current state (for debugging)."""
+        print(f"t = {self.t}, phase p = {self.phase}")
+        print(f"source = {self.source}")
+        print("Distances d:", self.d)
+        print("Visited mask:", self.visited)
+        print("Predecessors:", self.pred)
+
+    def set_graph_for_testing(self, W_np: np.ndarray, source: int = 0):
+        """
+        Override the internal graph with a specific adjacency matrix and source.
+        Only used in tests to make behaviour fully deterministic.
+        """
+        assert W_np.shape[0] == W_np.shape[1], "W must be square"
+        n = W_np.shape[0]
+
+        self.n_nodes = n
+        self.source = int(source)
+        # store weights as whatever the env already uses internally
+        self.W = torch.as_tensor(W_np, dtype=torch.float32, device=self.device)
+
+        # re-init BF state (same logic as in reset, but without sampling new graph)
+        self._reset_state_from_current_graph()
+
+    def _reset_state_from_current_graph(self):
+        """
+        Factor out the 'state reset' part of reset(), but without changing the graph.
+        Call this from reset() and from set_graph_for_testing().
+        """
+        n = self.n_nodes
+        self.t = 0
+        self.phase = 1 
+        self.best_obj = None
+        self._no_update_in_phase = True
+
+        # distances
+        self.d = np.full(n, np.inf, dtype=np.float32)
+        self.d[self.source] = 0.0
+
+        # predecessors
+        self.pi = np.full(n, -1, dtype=np.int64)
+
+        # visited/reachable mask (optional)
+        self.visited = np.zeros(n, dtype=np.float32)
+        self.visited[self.source] = 1.0
+
+        self._has_neg_cycle = False
