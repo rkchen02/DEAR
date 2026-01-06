@@ -1,87 +1,142 @@
-import os
+import argparse
 import time
-import gymnasium as gym
+from pathlib import Path
+
+import numpy as np
+import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
-from stable_baselines3.common.logger import configure
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
 from envs.bellman_ford_env import BellmanFordEnv
 
 
-class ProgressCallback(BaseCallback):
-    """
-    Custom callback for printing live progress updates every `print_freq` steps.
-    """
-    def __init__(self, total_timesteps, print_freq=5000, verbose=1):
-        super().__init__(verbose)
-        self.total_timesteps = total_timesteps
-        self.print_freq = print_freq
-        self.start_time = None
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a PPO agent on Bellman-FordEnv.")
+    parser.add_argument("--n-nodes", type=int, default=16)
+    parser.add_argument("--reward-mode", type=str, choices=["dense", "sparse"], default="sparse")
 
-    def _on_training_start(self):
-        self.start_time = time.time()
-        print(f"\nTraining started: {self.total_timesteps:,} total timesteps\n")
+    parser.add_argument(
+        "--no-clrs",
+        action="store_true",
+        help="Disable CLRS graphs and use random graphs instead.",
+    )
+    parser.add_argument(
+        "--clrs-root",
+        type=str,
+        default=None,
+        help="Root directory of CLRS PyTorch datasets (defaults to env's internal default).",
+    )
 
-    def _on_step(self):
-        # Print every N steps
-        if self.num_timesteps % self.print_freq == 0:
-            elapsed = time.time() - self.start_time
-            progress = self.num_timesteps / self.total_timesteps
-            eta = (elapsed / progress) - elapsed if progress > 0 else 0
-            print(f"Progress: {progress*100:5.1f}% | "
-                  f"Steps: {self.num_timesteps:,}/{self.total_timesteps:,} | "
-                  f"Elapsed: {elapsed/60:5.1f}m | ETA: {eta/60:5.1f}m")
-        return True
+    parser.add_argument("--n-envs", type=int, default=8)
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--seed", type=int, default=47)
 
-    def _on_training_end(self):
-        total_time = (time.time() - self.start_time) / 60
-        print(f"\nTraining complete in {total_time:.1f} minutes!\n")
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-range", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--n-steps", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--n-epochs", type=int, default=10)
 
-def make_env(seed=42):
-    """Create Bellman-Ford environment."""
-    return BellmanFordEnv(n_nodes=5, reward_mode="dense", seed=seed)
+    parser.add_argument("--checkpoint-freq", type=int, default=100_000)
+    parser.add_argument("--eval-freq", type=int, default=10_000)
+    parser.add_argument("--run-name", type=str, default=None)
+
+    return parser.parse_args()
+
+
+def make_env_fn(args: argparse.Namespace):
+    def _make_env():
+        env = BellmanFordEnv(
+            n_nodes=args.n_nodes,
+            reward_mode=args.reward_mode,
+            seed=None,
+            use_clrs=not args.no_clrs,
+            clrs_root=args.clrs_root,
+        )
+        return env
+
+    return _make_env
 
 
 def main():
-    log_dir = "./logs/bf_train"
-    checkpoint_dir = "./checkpoints"
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    args = parse_args()
 
-    env = make_env()
+    torch.set_num_threads(1)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
-    # Configure logger for TensorBoard
-    new_logger = configure(log_dir, ["stdout", "tensorboard"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Instantiate PPO agent
+    run_id = args.run_name or time.strftime("%Y%m%d-%H%M%S")
+    run_dir = Path("runs") / "bf_ppo" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    env_fn = make_env_fn(args)
+
+    env = make_vec_env(
+        env_fn,
+        n_envs=args.n_envs,
+        seed=args.seed,
+        monitor_dir=str(run_dir / "monitor"),
+    )
+
+    eval_env = make_vec_env(
+        env_fn,
+        n_envs=1,
+        seed=args.seed + 10_000,
+        monitor_dir=str(run_dir / "eval_monitor"),
+    )
+
     model = PPO(
-        policy="MultiInputPolicy",
-        env=env,
+        "MultiInputPolicy",
+        env,
+        learning_rate=args.learning_rate,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        device=device,
         verbose=1,
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
     )
-    model.set_logger(new_logger)
 
-    # Save checkpoints every 10 000 steps
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    best_model_dir = run_dir / "best_model"
+    best_model_dir.mkdir(parents=True, exist_ok=True)
+
     checkpoint_callback = CheckpointCallback(
-        save_freq=10_000,
-        save_path=checkpoint_dir,
-        name_prefix="bf_agent"
+        save_freq=args.checkpoint_freq,
+        save_path=str(checkpoint_dir),
+        name_prefix="bf_ppo",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
     )
 
-    # Train for 100 000 timesteps
-    progress_callback = ProgressCallback(total_timesteps=100_000, print_freq=5000)
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(best_model_dir),
+        log_path=str(run_dir / "eval"),
+        eval_freq=args.eval_freq,
+        deterministic=True,
+        render=False,
+    )
 
-    model.learn(total_timesteps=100_000, callback=checkpoint_callback)
+    model.learn(
+        total_timesteps=args.total_timesteps,
+        callback=[checkpoint_callback, eval_callback],
+    )
 
-    # Save final model
-    model.save(os.path.join(checkpoint_dir, "bf_agent_final"))
-    env.close()
+    model.save(str(run_dir / "final_model"))
 
 
 if __name__ == "__main__":
