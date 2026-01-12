@@ -76,6 +76,8 @@ class BellmanFordEnv(gym.Env):
 
         assert reward_mode in ("dense", "sparse")
         self.n_nodes = int(n_nodes)
+        self.max_nodes = int(n_nodes)
+        self.current_n_nodes = self.max_nodes
         self.reward_mode = reward_mode
         self.rng = np.random.RandomState(seed)
         self.allow_negative_weights = allow_negative_weights
@@ -129,39 +131,20 @@ class BellmanFordEnv(gym.Env):
 
         # --- Gym spaces -------------------------------------------------------
         # Action: choose a directed edge (u, v).
-        self.action_space = spaces.MultiDiscrete([self.n_nodes, self.n_nodes])
+        self.action_space = spaces.Discrete(self.max_nodes * self.max_nodes)
 
         # Observation: dict of numpy arrays.
         self.observation_space = spaces.Dict(
             {
-                "t": spaces.Box(
-                    low=0,
-                    high=np.iinfo(np.int32).max,
-                    shape=(),
-                    dtype=np.int32,
-                ),
-                "p": spaces.Discrete(2),  # phase; currently always 1
-                "source": spaces.Discrete(self.n_nodes),
-                "d": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.n_nodes,),
-                    dtype=np.float32,
-                ),
-                "visited": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(self.n_nodes,),
-                    dtype=np.float32,
-                ),
-                "pred": spaces.Box(
-                    low=-1,
-                    high=self.n_nodes - 1,
-                    shape=(self.n_nodes,),
-                    dtype=np.int32,
-                ),
+                "t": spaces.Box(0, self.max_steps, shape=(), dtype=np.int32),
+                "p": spaces.Box(1, 2, shape=(), dtype=np.int32),
+                "source": spaces.Box(0, self.max_nodes - 1, shape=(), dtype=np.int32),
+                "d": spaces.Box(-np.inf, np.inf, shape=(self.max_nodes,), dtype=np.float32),
+                "visited": spaces.Box(0.0, 1.0, shape=(self.max_nodes,), dtype=np.float32),
+                "pred": spaces.Box(-1, self.max_nodes - 1, shape=(self.max_nodes,), dtype=np.int32),
             }
         )
+
 
         # Internal state placeholders (initialised in reset()).
         self.W: Optional[np.ndarray] = None  # weight matrix [n, n], inf if no edge
@@ -189,27 +172,34 @@ class BellmanFordEnv(gym.Env):
         }
 
     def _graph_from_clrs_sample(self) -> Tuple[np.ndarray, int]:
-        """Get a graph from the CLRS dataset and convert it to (W, n)."""
+        """Get a graph from the CLRS dataset and convert it to a padded (W, n)."""
         assert self._clrs_dataset is not None
         idx = self._clrs_idx
         self._clrs_idx = (self._clrs_idx + 1) % len(self._clrs_dataset)
 
         data = self._clrs_dataset[idx]
 
-        # Expected fields from datasets/clrs_datasets.py:
-        # - data.num_nodes : int
-        # - data.edge_index : LongTensor [2, E]
-        # - data.A : FloatTensor [E] or [E, 1] with edge weights
         num_nodes = int(data.num_nodes)
+        n = min(num_nodes, self.max_nodes)
+
+        # CLRS graph representation (from datasets/clrs_datasets.py):
+        # - data.edge_index : LongTensor [2, E]
+        # - data.A          : FloatTensor [E] or [E, 1] with edge weights
         edge_index = data.edge_index.cpu().numpy()
-        edge_attr = data.A
-        edge_attr = edge_attr.view(-1).cpu().numpy().astype(np.float32)
+        edge_attr = data.A.view(-1).cpu().numpy().astype(np.float32)
 
-        W = np.full((num_nodes, num_nodes), np.inf, dtype=np.float32)
+        # Padded adjacency/weight matrix of fixed size (max_nodes x max_nodes).
+        W = np.full((self.max_nodes, self.max_nodes), np.inf, dtype=np.float32)
+
+        # Fill only edges that lie inside the first n nodes.
         for (u, v), w in zip(edge_index.T, edge_attr):
-            W[int(u), int(v)] = float(w)
+            u = int(u)
+            v = int(v)
+            if u < n and v < n:
+                W[u, v] = float(w)
 
-        return W, num_nodes
+        return W, n
+
 
     def _graph_random(self) -> Tuple[np.ndarray, int]:
         """Fallback random graph generator (Erdos–Rényi style)."""
@@ -306,9 +296,9 @@ class BellmanFordEnv(gym.Env):
 
         # Sample graph (CLRS if available, else random).
         if self.use_clrs and self._clrs_dataset is not None:
-            self.W, self.n_nodes = self._graph_from_clrs_sample()
+            self.W, self.current_n_nodes = self._graph_from_clrs_sample()
         else:
-            self.W, self.n_nodes = self._graph_random()
+            self.W, self.current_n_nodes = self._graph_random()
 
         # Build edge list & classical BF ground truth.
         self._build_edge_list()
@@ -323,10 +313,11 @@ class BellmanFordEnv(gym.Env):
         self.source = int(self.rng.randint(self.n_nodes))
 
         # Initialise distances / predecessors.
-        self.d = np.full(self.n_nodes, np.inf, dtype=np.float32)
-        self.pred = np.full(self.n_nodes, -1, dtype=np.int32)
-        self.visited = np.zeros(self.n_nodes, dtype=np.float32)
+        self.d = np.full(self.max_nodes, np.inf, dtype=np.float32)
+        self.pred = np.full(self.max_nodes, -1, dtype=np.int32)
+        self.visited = np.zeros(self.max_nodes, dtype=np.float32)
         self.d[self.source] = 0.0
+        self.visited[:] = 0.0
         self.visited[self.source] = 1.0
 
         self.t = 0
