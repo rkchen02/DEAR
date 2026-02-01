@@ -84,6 +84,8 @@ class BellmanFordEnv(gym.Env):
         self.min_weight = min_weight
         self.max_weight = max_weight
 
+        self.max_steps = max(1, (self.max_nodes - 1) * self.max_nodes * self.max_nodes)
+
         # --- CLRS integration -------------------------------------------------
         self.use_clrs = use_clrs
         self._clrs_dataset = None
@@ -138,7 +140,7 @@ class BellmanFordEnv(gym.Env):
             {
                 "t": spaces.Box(0, self.max_steps, shape=(), dtype=np.int32),
                 "p": spaces.Box(1, 2, shape=(), dtype=np.int32),
-                "source": spaces.Box(0, self.max_nodes - 1, shape=(), dtype=np.int32),
+                "source": spaces.Discrete(self.max_nodes),
                 "d": spaces.Box(-np.inf, np.inf, shape=(self.max_nodes,), dtype=np.float32),
                 "visited": spaces.Box(0.0, 1.0, shape=(self.max_nodes,), dtype=np.float32),
                 "pred": spaces.Box(-1, self.max_nodes - 1, shape=(self.max_nodes,), dtype=np.int32),
@@ -272,15 +274,29 @@ class BellmanFordEnv(gym.Env):
                 break
 
         return d, pred, has_neg_cycle
+    
+    def _pad_1d(self, arr, *, fill, dtype):
+        """Pad/truncate a 1D array-like to length self.max_nodes."""
+        a = np.asarray(arr, dtype=dtype)
+        if a.shape == (self.max_nodes,):
+            return a
+        out = np.full((self.max_nodes,), fill, dtype=dtype)
+        n = min(a.shape[0], self.max_nodes)
+        out[:n] = a[:n]
+        return out
 
     def _get_obs(self) -> Dict[str, Any]:
+        # Always return fixed-size tensors that match observation_space.
+        d = self._pad_1d(self.d, fill=np.inf, dtype=np.float32)
+        pred = self._pad_1d(self.pred, fill=-1, dtype=np.int32)
+        visited = self._pad_1d(self.visited, fill=0.0, dtype=np.float32)
         return {
+            "d": d,
+            "pred": pred,
+            "visited": visited,
+            "source": np.array(self.source, dtype=np.int32),
             "t": np.array(self.t, dtype=np.int32),
             "p": np.array(self.phase, dtype=np.int32),
-            "source": np.array(self.source, dtype=np.int32),
-            "d": self.d.copy(),
-            "visited": self.visited.copy(),
-            "pred": self.pred.copy(),
         }
 
     # ----------------------------------------------------------------- Env API
@@ -307,10 +323,10 @@ class BellmanFordEnv(gym.Env):
             raise RuntimeError("Graph has no edges; this should not happen.")
 
         # Horizon matches classical CLRS Bellman–Ford: (|V| - 1) * |E|.
-        self.max_steps = (self.n_nodes - 1) * num_edges
+        self.max_steps = max(1, (self.current_n_nodes - 1) * num_edges)
 
         # Sample a source node.
-        self.source = int(self.rng.randint(self.n_nodes))
+        self.source = int(self.rng.randint(self.current_n_nodes))
 
         # Initialise distances / predecessors.
         self.d = np.full(self.max_nodes, np.inf, dtype=np.float32)
@@ -336,18 +352,19 @@ class BellmanFordEnv(gym.Env):
         """
         Perform one Bellman–Ford relaxation step on edge (u, v) chosen by the agent.
         """
-        if isinstance(action, (list, tuple, np.ndarray)):
+        if isinstance(action, (np.integer, int)):
+            a = int(action)
+            u = a // self.max_nodes
+            v = a % self.max_nodes
+        elif isinstance(action, (list, tuple, np.ndarray)) and len(action) == 2:
             u, v = int(action[0]), int(action[1])
         else:
-            try:
-                u, v = map(int, action)
-            except TypeError:
-                raise ValueError(f"Unexpected action format: {action!r}")
+            raise ValueError(f"Unexpected action format: {action!r}")
 
         reward = 0.0
 
         # Invalid actions get a small penalty.
-        if not (0 <= u < self.n_nodes and 0 <= v < self.n_nodes):
+        if not (0 <= u < self.current_n_nodes and 0 <= v < self.current_n_nodes):
             reward = -1.0
         else:
             w = self.W[u, v]
@@ -413,43 +430,3 @@ class BellmanFordEnv(gym.Env):
         print("Distances d:", self.d)
         print("Visited mask:", self.visited)
         print("Predecessors:", self.pred)
-
-    def set_graph_for_testing(self, W_np: np.ndarray, source: int = 0):
-        """
-        Override the internal graph with a specific adjacency matrix and source.
-        Only used in tests to make behaviour fully deterministic.
-        """
-        assert W_np.shape[0] == W_np.shape[1], "W must be square"
-        n = W_np.shape[0]
-
-        self.n_nodes = n
-        self.source = int(source)
-        # store weights as whatever the env already uses internally
-        self.W = torch.as_tensor(W_np, dtype=torch.float32, device=self.device)
-
-        # re-init BF state (same logic as in reset, but without sampling new graph)
-        self._reset_state_from_current_graph()
-
-    def _reset_state_from_current_graph(self):
-        """
-        Factor out the 'state reset' part of reset(), but without changing the graph.
-        Call this from reset() and from set_graph_for_testing().
-        """
-        n = self.n_nodes
-        self.t = 0
-        self.phase = 1 
-        self.best_obj = None
-        self._no_update_in_phase = True
-
-        # distances
-        self.d = np.full(n, np.inf, dtype=np.float32)
-        self.d[self.source] = 0.0
-
-        # predecessors
-        self.pi = np.full(n, -1, dtype=np.int64)
-
-        # visited/reachable mask (optional)
-        self.visited = np.zeros(n, dtype=np.float32)
-        self.visited[self.source] = 1.0
-
-        self._has_neg_cycle = False

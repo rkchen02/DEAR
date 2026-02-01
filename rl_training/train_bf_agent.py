@@ -1,12 +1,14 @@
 import argparse
 import time
 from pathlib import Path
+import os
 
 import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from envs.bellman_ford_env import BellmanFordEnv
 
@@ -66,7 +68,13 @@ def make_env_fn(args: argparse.Namespace):
 def main():
     args = parse_args()
 
-    torch.set_num_threads(1)
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+
+    # When using SubprocVecEnv, env stepping happens in worker processes.
+    # Keep torch threads modest in the main learner process to avoid oversubscription.
+    torch_threads = max(1, min(4, slurm_cpus))
+    torch.set_num_threads(torch_threads)
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -83,6 +91,8 @@ def main():
         n_envs=args.n_envs,
         seed=args.seed,
         monitor_dir=str(run_dir / "monitor"),
+        vec_env_cls=SubprocVecEnv,
+        vec_env_kwargs={"start_method": "forkserver"},
     )
 
     eval_env = make_vec_env(
@@ -90,6 +100,8 @@ def main():
         n_envs=1,
         seed=args.seed + 10_000,
         monitor_dir=str(run_dir / "eval_monitor"),
+        vec_env_cls=SubprocVecEnv,
+        vec_env_kwargs={"start_method": "forkserver"},
     )
 
     model = PPO(
