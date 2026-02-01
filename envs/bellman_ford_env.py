@@ -294,9 +294,9 @@ class BellmanFordEnv(gym.Env):
             "d": d,
             "pred": pred,
             "visited": visited,
-            "source": np.array(self.source, dtype=np.int32),
-            "t": np.array(self.t, dtype=np.int32),
-            "p": np.array(self.phase, dtype=np.int32),
+            "source": int(self.source),
+            "t": np.int32(self.t),
+            "p": np.int32(self.phase),
         }
 
     # ----------------------------------------------------------------- Env API
