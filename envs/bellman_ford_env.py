@@ -288,6 +288,8 @@ class BellmanFordEnv(gym.Env):
     def _get_obs(self) -> Dict[str, Any]:
         # Always return fixed-size tensors that match observation_space.
         d = self._pad_1d(self.d, fill=np.inf, dtype=np.float32)
+        D_INF = np.float32(1e6)
+        d = np.where(np.isinf(d), D_INF, d).astype(np.float32)
         pred = self._pad_1d(self.pred, fill=-1, dtype=np.int32)
         visited = self._pad_1d(self.visited, fill=0.0, dtype=np.float32)
         return {
