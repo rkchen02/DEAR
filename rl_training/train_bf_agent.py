@@ -2,6 +2,7 @@ import argparse
 import time
 from pathlib import Path
 import os
+import signal
 
 import numpy as np
 import torch
@@ -72,7 +73,7 @@ def main():
 
     # When using SubprocVecEnv, env stepping happens in worker processes.
     # Keep torch threads modest in the main learner process to avoid oversubscription.
-    torch_threads = max(1, min(4, slurm_cpus))
+    torch_threads = 1 if torch.cuda.is_available() else max(1, min(4, slurm_cpus))
     torch.set_num_threads(torch_threads)
 
     np.random.seed(args.seed)
@@ -142,6 +143,23 @@ def main():
         deterministic=True,
         render=False,
     )
+
+    def _handle_termination(signum, frame):
+        print(f"[signal] received {signum}; saving emergency checkpoint...")
+        try:
+            model.save(str(run_dir / "emergency_model"))
+            print("[signal] emergency checkpoint saved")
+        except Exception as e:
+            print(f"[signal] failed to save emergency checkpoint: {e!r}")
+        try:
+            env.close()
+            eval_env.close()
+        except Exception:
+            pass
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGUSR1, _handle_termination)
+    signal.signal(signal.SIGTERM, _handle_termination)
 
     model.learn(
         total_timesteps=args.total_timesteps,
