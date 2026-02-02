@@ -138,8 +138,8 @@ class BellmanFordEnv(gym.Env):
         # Observation: dict of numpy arrays.
         self.observation_space = spaces.Dict(
             {
-                "t": spaces.Box(0, self.max_steps, shape=(), dtype=np.int32),
-                "p": spaces.Box(1, 2, shape=(), dtype=np.int32),
+                "t": spaces.Box(0, self.max_steps, shape=(1,), dtype=np.int32),
+                "p": spaces.Box(1, 2, shape=(1,), dtype=np.int32),
                 "source": spaces.Discrete(self.max_nodes),
                 "d": spaces.Box(-np.inf, np.inf, shape=(self.max_nodes,), dtype=np.float32),
                 "visited": spaces.Box(0.0, 1.0, shape=(self.max_nodes,), dtype=np.float32),
@@ -297,8 +297,8 @@ class BellmanFordEnv(gym.Env):
             "pred": pred,
             "visited": visited,
             "source": int(self.source),
-            "t": np.array(self.t, dtype=np.int32),
-            "p": np.array(self.phase, dtype=np.int32),
+            "t": np.array([self.t], dtype=np.int32),
+            "p": np.array([self.phase], dtype=np.int32),
         }
 
     # ----------------------------------------------------------------- Env API
