@@ -364,6 +364,7 @@ class BellmanFordEnv(gym.Env):
             raise ValueError(f"Unexpected action format: {action!r}")
 
         reward = 0.0
+        relaxed = False
 
         # Invalid actions get a small penalty.
         if not (0 <= u < self.current_n_nodes and 0 <= v < self.current_n_nodes):
@@ -374,6 +375,7 @@ class BellmanFordEnv(gym.Env):
                 new_d = self.d[u] + w
                 if new_d < self.d[v]:
                     # Successful relaxation.
+                    relaxed = True
                     self.d[v] = new_d
                     self.pred[v] = u
                     self.visited[v] = 1.0
@@ -396,9 +398,49 @@ class BellmanFordEnv(gym.Env):
         if self.t >= self.max_steps:
             terminated = True
 
+        info: Dict[str, Any] = {
+            "t": int(self.t),
+            "relaxed": bool(relaxed),
+        }
+
+        # For sparse reward, only score at the end (plus invalid-action penalty if any).
+        if terminated and self.reward_mode == "sparse":
+            solved = self._is_solved()
+            info["is_success"] = bool(solved)
+            if solved:
+                reward += 1.0
+
         obs = self._get_obs()
-        info: Dict[str, Any] = {}
         return obs, float(reward), terminated, truncated, info
+
+    def _is_solved(self) -> bool:
+        """Return True if the current (d, pred) match the reference solution."""
+        if self.opt_d is None or self.opt_pred is None:
+            return False
+
+        n = int(self.current_n_nodes)
+
+        d = np.asarray(self.d[:n], dtype=np.float32)
+        opt = np.asarray(self.opt_d[:n], dtype=np.float32)
+
+        finite_mask = np.isfinite(opt) & np.isfinite(d)
+        inf_both = (~np.isfinite(opt)) & (~np.isfinite(d))
+
+        if not np.allclose(d[finite_mask], opt[finite_mask], atol=1e-5, rtol=0.0):
+            return False
+        if not np.all(inf_both | finite_mask):
+            return False
+
+        reachable = np.isfinite(opt)
+        pred = np.asarray(self.pred[:n], dtype=np.int32)
+        opt_pred = np.asarray(self.opt_pred[:n], dtype=np.int32)
+
+        src = int(self.source)
+        ok = (pred == opt_pred) & reachable
+        if src < n and reachable[src]:
+            ok[src] = True
+
+        return bool(np.all(ok[reachable]))
 
     # ------------------------------------------------------------- diagnostics
     def compute_metrics(self) -> Dict[str, float]:
@@ -407,17 +449,22 @@ class BellmanFordEnv(gym.Env):
         """
         if self.opt_d is None or self.opt_pred is None:
             return {}
+        
+        n = int(self.current_n_nodes)
+        d = np.asarray(self.d[:n], dtype=np.float32)
+        opt_d = np.asarray(self.opt_d[:n], dtype=np.float32)
 
-        dist_error = float(
-            np.nanmean(
-                np.where(
-                    np.isfinite(self.opt_d),
-                    np.abs(self.d - self.opt_d),
-                    0.0,
-                )
-            )
-        )
-        pred_accuracy = float(np.mean(self.pred == self.opt_pred))
+        reachable = np.isfinite(opt_d)
+        finite_both = reachable & np.isfinite(d)
+        mismatch_reachability = reachable ^ np.isfinite(d)
+
+        mae = float(np.mean(np.abs(d[finite_both] - opt_d[finite_both]))) if np.any(finite_both) else 0.0
+        penalty = float(np.mean(mismatch_reachability.astype(np.float32))) * 1e3
+        dist_error = mae + penalty
+
+        pred = np.asarray(self.pred[:n], dtype=np.int32)
+        opt_pred = np.asarray(self.opt_pred[:n], dtype=np.int32)
+        pred_accuracy = float(np.mean((pred[reachable] == opt_pred[reachable]).astype(np.float32))) if np.any(reachable) else 0.0
 
         return {
             "dist_error": dist_error,

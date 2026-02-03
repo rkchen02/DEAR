@@ -31,6 +31,19 @@ def parse_args() -> argparse.Namespace:
         help="Root directory of CLRS PyTorch datasets (defaults to env's internal default).",
     )
 
+    parser.add_argument(
+        "--clrs-train-split",
+        type=str,
+        default="train",
+        help="CLRS split for training env (train/val/test).",
+    )
+    parser.add_argument(
+        "--clrs-eval-split",
+        type=str,
+        default="val",
+        help="CLRS split for eval env (train/val/test).",
+    )
+
     parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--seed", type=int, default=47)
@@ -53,13 +66,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_env_fn(args: argparse.Namespace):
-    def _make_env():
+    def _make_env(clrs_split: str):
         env = BellmanFordEnv(
             n_nodes=args.n_nodes,
             reward_mode=args.reward_mode,
             seed=None,
             use_clrs=not args.no_clrs,
             clrs_root=args.clrs_root,
+            clrs_split=clrs_split,
         )
         return env
 
@@ -88,7 +102,7 @@ def main():
     env_fn = make_env_fn(args)
 
     env = make_vec_env(
-        env_fn,
+        lambda: env_fn(args.clrs_train_split),
         n_envs=args.n_envs,
         seed=args.seed,
         monitor_dir=str(run_dir / "monitor"),
@@ -97,7 +111,7 @@ def main():
     )
 
     eval_env = make_vec_env(
-        env_fn,
+        lambda: env_fn(args.clrs_eval_split),
         n_envs=1,
         seed=args.seed + 10_000,
         monitor_dir=str(run_dir / "eval_monitor"),
