@@ -49,7 +49,7 @@ class BellmanFordEnv(gym.Env):
             `num_nodes` argument used when creating the CLRS dataset.
         reward_mode : {"dense", "sparse"}
             Dense: +1 for every successful relaxation, 0 otherwise.
-            Sparse: currently behaves the same as dense (can change shaping).
+            Sparse: reward only when episode terminates, with +1 if success else 0.
         seed : int, optional
             Random seed.
         use_clrs : bool
@@ -409,6 +409,12 @@ class BellmanFordEnv(gym.Env):
             info["is_success"] = bool(solved)
             if solved:
                 reward += 1.0
+        
+        if terminated or truncated:
+            metrics = self.compute_metrics()
+            info.update(metrics)
+            info["is_success"] = bool(metrics.get("is_success", info.get("is_success", False)))
+
 
         obs = self._get_obs()
         return obs, float(reward), terminated, truncated, info

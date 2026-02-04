@@ -14,6 +14,70 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.bellman_ford_env import BellmanFordEnv
 
 
+class BellmanFordEvalCallback(EvalCallback):
+    """
+    Extends SB3 EvalCallback to aggregate extra per-episode metrics from `info`
+    during evaluation. Metrics are read when an eval episode terminates.
+    Expect env to put these keys into `info` on done:
+      - "dist_error" (float)
+      - "pred_accuracy" (float)
+      - "is_success" (bool/int)  # already used by SB3
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dist_error_buffer = []
+        self._pred_acc_buffer = []
+
+    def _log_success_callback(self, locals_, globals_) -> None:
+        """
+        Called by SB3's evaluate_policy() after each step during evaluation.
+        We hook into it to also collect our custom metrics.
+        """
+        # Keep SB3's default success tracking behavior.
+        super()._log_success_callback(locals_, globals_)
+
+        done = locals_.get("done")
+        info = locals_.get("info")
+
+        if not done or info is None:
+            return
+
+        # Only collect at episode end.
+        if "dist_error" in info:
+            try:
+                self._dist_error_buffer.append(float(info["dist_error"]))
+            except Exception:
+                pass
+
+        if "pred_accuracy" in info:
+            try:
+                self._pred_acc_buffer.append(float(info["pred_accuracy"]))
+            except Exception:
+                pass
+
+    def _on_step(self) -> bool:
+        # Reset buffers right before an evaluation happens (so they don't mix across evals).
+        # EvalCallback triggers evaluation inside super()._on_step().
+        self._dist_error_buffer = []
+        self._pred_acc_buffer = []
+
+        result = super()._on_step()
+
+        # If an evaluation just happened, EvalCallback sets `self.last_mean_reward`.
+        # We can also log our aggregated means if buffers are non-empty.
+        if self.n_calls % self.eval_freq == 0:
+            if len(self._dist_error_buffer) > 0:
+                self.logger.record("eval/dist_error", float(np.mean(self._dist_error_buffer)))
+                self.logger.record("eval/dist_error_std", float(np.std(self._dist_error_buffer)))
+
+            if len(self._pred_acc_buffer) > 0:
+                self.logger.record("eval/pred_accuracy", float(np.mean(self._pred_acc_buffer)))
+                self.logger.record("eval/pred_accuracy_std", float(np.std(self._pred_acc_buffer)))
+
+        return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a PPO agent on Bellman-FordEnv.")
     parser.add_argument("--n-nodes", type=int, default=16)
@@ -149,11 +213,12 @@ def main():
         save_vecnormalize=False,
     )
 
-    eval_callback = EvalCallback(
+    eval_callback = BellmanFordEvalCallback(
         eval_env,
         best_model_save_path=str(best_model_dir),
         log_path=str(run_dir / "eval"),
         eval_freq=args.eval_freq,
+        n_eval_episodes=20,
         deterministic=True,
         render=False,
     )
