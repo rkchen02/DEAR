@@ -1,6 +1,7 @@
 import os
 import warnings
 from typing import Any, Dict, Optional, Tuple
+import random
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -37,6 +38,10 @@ class BellmanFordEnv(gym.Env):
         clrs_split: str = "train",
         clrs_sampler_type: str = "normal",
         clrs_randomise_pos: bool = True,
+        max_nodes: Optional[int] = None,
+        train_nodes: Optional[list[int]] = None,
+        fixed_nodes: Optional[int] = None,
+        clrs_num_nodes_list: Optional[list[int]] = None,
         allow_negative_weights: bool = True,
         min_weight: float = -1.0,
         max_weight: float = 1.0,
@@ -76,20 +81,27 @@ class BellmanFordEnv(gym.Env):
 
         assert reward_mode in ("dense", "sparse")
         self.n_nodes = int(n_nodes)
-        self.max_nodes = int(n_nodes)
-        self.current_n_nodes = self.max_nodes
+        self.max_nodes = int(max_nodes) if max_nodes is not None else int(n_nodes)
+        if self.max_nodes < self.n_nodes:
+            raise ValueError(f"max_nodes ({self.max_nodes}) must be >= n_nodes ({self.n_nodes})")
+
+        if train_nodes is None:
+            train_nodes = [int(n_nodes)]
+        self.train_nodes = [int(x) for x in train_nodes]
+        self.fixed_nodes = int(fixed_nodes) if fixed_nodes is not None else None
+
+        self.current_n_nodes = int(n_nodes)
         self.reward_mode = reward_mode
         self.rng = np.random.RandomState(seed)
         self.allow_negative_weights = allow_negative_weights
         self.min_weight = min_weight
         self.max_weight = max_weight
-
-        self.max_steps = max(1, (self.max_nodes - 1) * self.max_nodes * self.max_nodes)
+        self.max_steps = max(1, (self.max_nodes - 1) * self.max_nodes)
 
         # --- CLRS integration -------------------------------------------------
         self.use_clrs = use_clrs
-        self._clrs_dataset = None
-        self._clrs_idx = 0
+        self._clrs_datasets: Dict[int, Any] = {}
+        self._clrs_idx: Dict[int, int] = {}
 
         if self.use_clrs:
             try:
@@ -103,32 +115,49 @@ class BellmanFordEnv(gym.Env):
                     )
                     clrs_root = os.path.join(repo_root, "data", "clrs")
 
-                self._clrs_dataset = CLRSData(
-                    root=clrs_root,
-                    num_nodes=self.n_nodes,
-                    num_samples=clrs_num_samples,
-                    algorithm="bellman_ford",
-                    split=clrs_split,
-                    sampler_type=clrs_sampler_type,
-                    randomise_pos=clrs_randomise_pos,
-                    seed=seed if seed is not None else 0,
-                )
-                if len(self._clrs_dataset) == 0:
+                if clrs_num_nodes_list is None:
+                    sizes = set(self.train_nodes)
+                    if self.fixed_nodes is not None:
+                        sizes.add(self.fixed_nodes)
+                    sizes.add(self.n_nodes)
+                    clrs_num_nodes_list = sorted(sizes)
+                else:
+                    clrs_num_nodes_list = [int(x) for x in clrs_num_nodes_list]
+
+                for nn in clrs_num_nodes_list:
+                    ds = CLRSData(
+                        root=clrs_root,
+                        num_nodes=nn,
+                        num_samples=clrs_num_samples,
+                        algorithm="bellman_ford",
+                        split=clrs_split,
+                        sampler_type=clrs_sampler_type,
+                        randomise_pos=clrs_randomise_pos,
+                        seed=seed if seed is not None else 0,
+                    )
+                    if len(ds) == 0:
+                        warnings.warn(
+                            f"CLRS dataset bellman_ford for num_nodes={nn} is empty; skipping."
+                        )
+                        continue
+                    self._clrs_datasets[nn] = ds
+                    self._clrs_idx[nn] = 0
+
+                if not self._clrs_datasets:
                     warnings.warn(
                         "CLRS dataset for bellman_ford is empty; "
                         "falling back to random graphs."
                     )
-                    self._clrs_dataset = None
+                    self._clrs_datasets = {}
                     self.use_clrs = False
-            except Exception as e:  # pragma: no cover - defensive
+            except Exception as e:
                 warnings.warn(
                     f"Could not construct CLRS bellman_ford dataset "
                     f"(error: {e!r}); falling back to random graphs.\n"
-                    "If you want CLRS graphs, make sure that "
+                    "For CLRS graphs, make sure that "
                     "datasets/clrs_datasets.py is on the Python path and that "
                     "prepare_datasets.py has been run for bellman_ford."
                 )
-                self._clrs_dataset = None
                 self.use_clrs = False
 
         # --- Gym spaces -------------------------------------------------------
@@ -138,7 +167,7 @@ class BellmanFordEnv(gym.Env):
         # Observation: dict of numpy arrays.
         self.observation_space = spaces.Dict(
             {
-                "t": spaces.Box(0, self.max_steps, shape=(1,), dtype=np.int32),
+                "t": spaces.Box(0, np.iinfo(np.int32).max, shape=(1,), dtype=np.int32),
                 "p": spaces.Box(1, 2, shape=(1,), dtype=np.int32),
                 "source": spaces.Discrete(self.max_nodes),
                 "d": spaces.Box(-np.inf, np.inf, shape=(self.max_nodes,), dtype=np.float32),
@@ -152,9 +181,9 @@ class BellmanFordEnv(gym.Env):
         self.W: Optional[np.ndarray] = None  # weight matrix [n, n], inf if no edge
         self.edge_list = []  # list of (u, v) with an edge
         self.source: int = 0
-        self.d: np.ndarray = np.zeros(self.n_nodes, dtype=np.float32)
-        self.pred: np.ndarray = -np.ones(self.n_nodes, dtype=np.int32)
-        self.visited: np.ndarray = np.zeros(self.n_nodes, dtype=np.float32)
+        self.d: np.ndarray = np.full(self.max_nodes, np.inf, dtype=np.float32)
+        self.pred: np.ndarray = -np.ones(self.max_nodes, dtype=np.int32)
+        self.visited: np.ndarray = np.zeros(self.max_nodes, dtype=np.float32)
         self.t: int = 0
         self.phase: int = 1
         self.max_steps: int = 0  # set after we know |E|
@@ -165,21 +194,26 @@ class BellmanFordEnv(gym.Env):
     # ------------------------------------------------------------------ utils
     def _empty_obs(self) -> Dict[str, Any]:
         return {
-            "t": np.array(0, dtype=np.int32),
-            "p": np.array(1, dtype=np.int32),
-            "source": np.array(0, dtype=np.int32),
-            "d": np.full(self.n_nodes, np.inf, dtype=np.float32),
-            "visited": np.zeros(self.n_nodes, dtype=np.float32),
-            "pred": np.full(self.n_nodes, -1, dtype=np.int32),
+            "t": np.array([0], dtype=np.int32),
+            "p": np.array([1], dtype=np.int32),
+            "source": 0,
+            "d": np.full((self.max_nodes,), np.inf, dtype=np.float32),
+            "visited": np.zeros((self.max_nodes,), dtype=np.float32),
+            "pred": np.full((self.max_nodes,), -1, dtype=np.int32),
         }
 
     def _graph_from_clrs_sample(self) -> Tuple[np.ndarray, int]:
         """Get a graph from the CLRS dataset and convert it to a padded (W, n)."""
-        assert self._clrs_dataset is not None
-        idx = self._clrs_idx
-        self._clrs_idx = (self._clrs_idx + 1) % len(self._clrs_dataset)
+        ds = self._clrs_datasets.get(int(num_nodes))
+        if ds is None:
+            raise RuntimeError(
+                f"Requested CLRS num_nodes={num_nodes} but no dataset was loaded for that size. "
+                f"Loaded sizes: {sorted(self._clrs_datasets.keys())}"
+            )
+        idx = self._clrs_idx[int(num_nodes)]
+        self._clrs_idx[int(num_nodes)] = (idx + 1) % len(ds)
 
-        data = self._clrs_dataset[idx]
+        data = ds[idx]
 
         num_nodes = int(data.num_nodes)
         n = min(num_nodes, self.max_nodes)
@@ -205,8 +239,8 @@ class BellmanFordEnv(gym.Env):
 
     def _graph_random(self) -> Tuple[np.ndarray, int]:
         """Fallback random graph generator (Erdos–Rényi style)."""
-        n = self.n_nodes
-        W = np.full((n, n), np.inf, dtype=np.float32)
+        n = int(self.n_nodes)
+        W = np.full((self.max_nodes, self.max_nodes), np.inf, dtype=np.float32)
 
         p_edge = 0.5
         for u in range(n):
@@ -234,8 +268,8 @@ class BellmanFordEnv(gym.Env):
         assert self.W is not None
         self.edge_list = [
             (int(u), int(v))
-            for u in range(self.n_nodes)
-            for v in range(self.n_nodes)
+            for u in range(int(self.current_n_nodes))
+            for v in range(int(self.current_n_nodes))
             if np.isfinite(self.W[u, v])
         ]
 
@@ -243,7 +277,7 @@ class BellmanFordEnv(gym.Env):
         self, source: int
     ) -> Tuple[np.ndarray, np.ndarray, bool]:
         """Classical Bellman–Ford run used for targets / metrics."""
-        n = self.n_nodes
+        n = int(self.current_n_nodes)
         d = np.full(n, np.inf, dtype=np.float32)
         pred = -np.ones(n, dtype=np.int32)
         d[source] = 0.0
@@ -313,7 +347,11 @@ class BellmanFordEnv(gym.Env):
             self.rng.seed(seed)
 
         # Sample graph (CLRS if available, else random).
-        if self.use_clrs and self._clrs_dataset is not None:
+        if self.use_clrs and self._clrs_datasets:
+            if self.fixed_nodes is not None:
+                n = int(self.fixed_nodes)
+            else:
+                n = int(random.choice(self.train_nodes))
             self.W, self.current_n_nodes = self._graph_from_clrs_sample()
         else:
             self.W, self.current_n_nodes = self._graph_random()
@@ -362,33 +400,27 @@ class BellmanFordEnv(gym.Env):
             u, v = int(action[0]), int(action[1])
         else:
             raise ValueError(f"Unexpected action format: {action!r}")
+        
+        if u < 0 or v < 0 or u >= self.current_n_nodes or v >= self.current_n_nodes:
+            # Penalise/ignore invalid actions; keep episode going.
+            obs = self._get_obs()
+            info: Dict[str, Any] = {"t": int(self.t), "relaxed": False, "is_success": 0.0}
+            return obs, -1.0, False, False, info
 
         reward = 0.0
         relaxed = False
 
-        # Invalid actions get a small penalty.
-        if not (0 <= u < self.current_n_nodes and 0 <= v < self.current_n_nodes):
-            reward = -1.0
-        else:
-            w = self.W[u, v]
-            if np.isfinite(w) and np.isfinite(self.d[u]):
-                new_d = self.d[u] + w
-                if new_d < self.d[v]:
-                    # Successful relaxation.
-                    relaxed = True
-                    self.d[v] = new_d
-                    self.pred[v] = u
-                    self.visited[v] = 1.0
-                    if self.reward_mode == "dense":
-                        reward = 1.0
-                else:
-                    # No improvement on this edge.
-                    if self.reward_mode == "dense":
-                        reward = 0.0
-            else:
-                # Relaxing a non-edge or from an unreachable node.
+        w = self.W[u, v]
+        if np.isfinite(w) and np.isfinite(self.d[u]):
+            new_d = self.d[u] + w
+            if new_d < self.d[v]:
+                relaxed = True
+                self.d[v] = new_d
+                self.pred[v] = u
+                self.visited[v] = 1.0
                 if self.reward_mode == "dense":
-                    reward = 0.0
+                    reward = 1.0
+        # else: no-op; dense gives 0, sparse gives 0 (until terminal bonus)
 
         self.t += 1
 
@@ -403,18 +435,15 @@ class BellmanFordEnv(gym.Env):
             "relaxed": bool(relaxed),
         }
 
-        # For sparse reward, only score at the end (plus invalid-action penalty if any).
-        if terminated and self.reward_mode == "sparse":
-            solved = self._is_solved()
-            info["is_success"] = bool(solved)
-            if solved:
+        if terminated:
+            solved = bool(self._is_solved())
+            info["is_success"] = solved
+            if self.reward_mode == "sparse" and solved:
                 reward += 1.0
         
         if terminated or truncated:
             metrics = self.compute_metrics()
             info.update(metrics)
-            info["is_success"] = bool(metrics.get("is_success", info.get("is_success", False)))
-
 
         obs = self._get_obs()
         return obs, float(reward), terminated, truncated, info

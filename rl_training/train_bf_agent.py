@@ -84,6 +84,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-mode", type=str, choices=["dense", "sparse"], default="sparse")
 
     parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=None,
+        help="Fixed max_nodes for observation/action spaces (e.g. 64). If None, uses max(train/eval).",
+    )
+    parser.add_argument(
+        "--train-nodes",
+        type=str,
+        default=None,
+        help="Comma-separated node sizes to train on (e.g. '16' or '10,15'). Defaults to --n-nodes.",
+    )
+    parser.add_argument(
+        "--eval-nodes",
+        type=int,
+        default=None,
+        help="Fixed node size for eval env during training (defaults to --n-nodes).",
+    )
+
+    parser.add_argument(
         "--no-clrs",
         action="store_true",
         help="Disable CLRS graphs and use random graphs instead.",
@@ -129,23 +148,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_env_fn(args: argparse.Namespace):
-    def _make_env(clrs_split: str):
+def _parse_nodes_csv(s: str) -> list[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+def make_env_fn(args: argparse.Namespace, *, split: str, fixed_nodes: int, train_nodes: list[int], max_nodes: int):
+    def _make_env():
         env = BellmanFordEnv(
-            n_nodes=args.n_nodes,
+            n_nodes=fixed_nodes,
+            max_nodes=max_nodes,
+            train_nodes=train_nodes,
+            fixed_nodes=fixed_nodes,
             reward_mode=args.reward_mode,
             seed=None,
             use_clrs=not args.no_clrs,
             clrs_root=args.clrs_root,
-            clrs_split=clrs_split,
+            clrs_split=split,
+            clrs_num_nodes_list=sorted(set(train_nodes + [fixed_nodes])),
         )
         return env
-
     return _make_env
 
 
 def main():
     args = parse_args()
+    train_nodes = _parse_nodes_csv(args.train_nodes) if args.train_nodes else [int(args.n_nodes)]
+    eval_nodes = int(args.eval_nodes) if args.eval_nodes is not None else int(args.n_nodes)
+    if args.max_nodes is None:
+        max_nodes = max(train_nodes + [eval_nodes])
+    else:
+        max_nodes = int(args.max_nodes)
 
     slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
 
@@ -163,10 +194,15 @@ def main():
     run_dir = Path("runs") / "bf_ppo" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    env_fn = make_env_fn(args)
+    env_fn = make_env_fn(
+        args,
+        split=args.clrs_train_split,
+        fixed_nodes=train_nodes[0],
+        train_nodes=train_nodes,
+        max_nodes=max_nodes,)
 
     env = make_vec_env(
-        lambda: env_fn(args.clrs_train_split),
+        env_fn,
         n_envs=args.n_envs,
         seed=args.seed,
         monitor_dir=str(run_dir / "monitor"),
@@ -175,7 +211,7 @@ def main():
     )
 
     eval_env = make_vec_env(
-        lambda: env_fn(args.clrs_eval_split),
+        env_fn,
         n_envs=1,
         seed=args.seed + 10_000,
         monitor_dir=str(run_dir / "eval_monitor"),
