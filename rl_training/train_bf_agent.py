@@ -194,15 +194,26 @@ def main():
     run_dir = Path("runs") / "bf_ppo" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    env_fn = make_env_fn(
+    # Training env: sample from train_nodes, but keep observation/action spaces fixed by max_nodes.
+    train_env_fn = make_env_fn(
         args,
         split=args.clrs_train_split,
         fixed_nodes=train_nodes[0],
         train_nodes=train_nodes,
-        max_nodes=max_nodes,)
+        max_nodes=max_nodes,
+    )
+
+    # Eval env: potentially different split + different fixed_nodes (OOD eval).
+    eval_env_fn = make_env_fn(
+        args,
+        split=args.clrs_eval_split,
+        fixed_nodes=eval_nodes,
+        train_nodes=train_nodes,
+        max_nodes=max_nodes,
+    )
 
     env = make_vec_env(
-        env_fn,
+        train_env_fn,
         n_envs=args.n_envs,
         seed=args.seed,
         monitor_dir=str(run_dir / "monitor"),
@@ -211,7 +222,7 @@ def main():
     )
 
     eval_env = make_vec_env(
-        env_fn,
+        eval_env_fn,
         n_envs=1,
         seed=args.seed + 10_000,
         monitor_dir=str(run_dir / "eval_monitor"),
