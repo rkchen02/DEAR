@@ -202,21 +202,21 @@ class BellmanFordEnv(gym.Env):
             "pred": np.full((self.max_nodes,), -1, dtype=np.int32),
         }
 
-    def _graph_from_clrs_sample(self) -> Tuple[np.ndarray, int]:
+    def _graph_from_clrs_sample(self, num_nodes: int) -> Tuple[np.ndarray, int]:
         """Get a graph from the CLRS dataset and convert it to a padded (W, n)."""
-        ds = self._clrs_datasets.get(int(num_nodes))
+        ds = self._clrs_datasets.get(num_nodes)
         if ds is None:
             raise RuntimeError(
                 f"Requested CLRS num_nodes={num_nodes} but no dataset was loaded for that size. "
                 f"Loaded sizes: {sorted(self._clrs_datasets.keys())}"
             )
-        idx = self._clrs_idx[int(num_nodes)]
-        self._clrs_idx[int(num_nodes)] = (idx + 1) % len(ds)
+        idx = int(self._clrs_idx.get(num_nodes, 0))
+        self._clrs_idx[num_nodes] = (idx + 1) % len(ds)
 
         data = ds[idx]
 
-        num_nodes = int(data.num_nodes)
-        n = min(num_nodes, self.max_nodes)
+        data_num_nodes = int(data.num_nodes)
+        n = min(data_num_nodes, self.max_nodes)
 
         # CLRS graph representation (from datasets/clrs_datasets.py):
         # - data.edge_index : LongTensor [2, E]
@@ -348,11 +348,8 @@ class BellmanFordEnv(gym.Env):
 
         # Sample graph (CLRS if available, else random).
         if self.use_clrs and self._clrs_datasets:
-            if self.fixed_nodes is not None:
-                n = int(self.fixed_nodes)
-            else:
-                n = int(random.choice(self.train_nodes))
-            self.W, self.current_n_nodes = self._graph_from_clrs_sample()
+            chosen_n = int(self.fixed_nodes) if self.fixed_nodes is not None else int(random.choice(self.train_nodes))
+            self.W, self.current_n_nodes = self._graph_from_clrs_sample(chosen_n)
         else:
             self.W, self.current_n_nodes = self._graph_random()
 
