@@ -335,6 +335,40 @@ class BellmanFordEnv(gym.Env):
             "p": np.array([self.phase], dtype=np.int32),
         }
 
+    def edge_to_action(self, u: int, v: int) -> int:
+        return int(u) * self.max_nodes + int(v)
+
+    def action_to_edge(self, action: int) -> Tuple[int, int]:
+        a = int(action)
+        return a // self.max_nodes, a % self.max_nodes
+
+    def get_expert_action(self) -> int:
+        """
+        Return the canonical Bellman-Ford teacher action for the current step.
+
+        The teacher follows the fixed scan order induced by self.edge_list and
+        repeats that order for each pass. Since the episode horizon is exactly
+        (|V| - 1) * |E|, this recovers the standard deterministic Bellman-Ford
+        execution schedule.
+        """
+        if not self.edge_list:
+            raise RuntimeError("Environment must be reset before calling get_expert_action().")
+
+        idx = self.t % len(self.edge_list)
+        u, v = self.edge_list[idx]
+        return self.edge_to_action(u, v)
+
+    def get_valid_action_mask(self) -> np.ndarray:
+        """
+        Return a binary mask over the discrete action space indicating which
+        actions correspond to edges present in the current graph.
+        """
+        mask = np.zeros((self.max_nodes * self.max_nodes,), dtype=np.float32)
+        for u, v in self.edge_list:
+            if 0 <= u < self.current_n_nodes and 0 <= v < self.current_n_nodes:
+                mask[self.edge_to_action(u, v)] = 1.0
+        return mask
+
     # ----------------------------------------------------------------- Env API
     def reset(
         self,
@@ -399,10 +433,10 @@ class BellmanFordEnv(gym.Env):
             raise ValueError(f"Unexpected action format: {action!r}")
         
         if u < 0 or v < 0 or u >= self.current_n_nodes or v >= self.current_n_nodes:
-            # Penalise/ignore invalid actions; keep episode going.
-            obs = self._get_obs()
-            info: Dict[str, Any] = {"t": int(self.t), "relaxed": False, "is_success": 0.0}
-            return obs, -1.0, False, False, info
+            raise ValueError(
+                f"Received invalid action ({u}, {v}) for current_n_nodes={self.current_n_nodes}. "
+                "With action masking enabled, this should not happen."
+            )
 
         reward = 0.0
         relaxed = False
@@ -444,6 +478,15 @@ class BellmanFordEnv(gym.Env):
 
         obs = self._get_obs()
         return obs, float(reward), terminated, truncated, info
+
+    def action_masks(self) -> np.ndarray:
+        """
+        Return a boolean mask over the discrete action space.
+
+        True means the action is valid and may be sampled.
+        False means the action is invalid and should be masked out.
+        """
+        return self.get_valid_action_mask().astype(bool)
 
     def _is_solved(self) -> bool:
         """Return True if the current (d, pred) match the reference solution."""

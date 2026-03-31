@@ -11,71 +11,74 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+
 from envs.bellman_ford_env import BellmanFordEnv
 
 
-class BellmanFordEvalCallback(EvalCallback):
-    """
-    Extends SB3 EvalCallback to aggregate extra per-episode metrics from `info`
-    during evaluation. Metrics are read when an eval episode terminates.
-    Expect env to put these keys into `info` on done:
-      - "dist_error" (float)
-      - "pred_accuracy" (float)
-      - "is_success" (bool/int)  # already used by SB3
-    """
+# class BellmanFordEvalCallback(EvalCallback):
+#     """
+#     Extends SB3 EvalCallback to aggregate extra per-episode metrics from `info`
+#     during evaluation. Metrics are read when an eval episode terminates.
+#     Expect env to put these keys into `info` on done:
+#       - "dist_error" (float)
+#       - "pred_accuracy" (float)
+#       - "is_success" (bool/int)  # already used by SB3
+#     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._dist_error_buffer = []
-        self._pred_acc_buffer = []
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self._dist_error_buffer = []
+#         self._pred_acc_buffer = []
 
-    def _log_success_callback(self, locals_, globals_) -> None:
-        """
-        Called by SB3's evaluate_policy() after each step during evaluation.
-        We hook into it to also collect our custom metrics.
-        """
-        # Keep SB3's default success tracking behavior.
-        super()._log_success_callback(locals_, globals_)
+#     def _log_success_callback(self, locals_, globals_) -> None:
+#         """
+#         Called by SB3's evaluate_policy() after each step during evaluation.
+#         We hook into it to also collect our custom metrics.
+#         """
+#         # Keep SB3's default success tracking behavior.
+#         super()._log_success_callback(locals_, globals_)
 
-        done = locals_.get("done")
-        info = locals_.get("info")
+#         done = locals_.get("done")
+#         info = locals_.get("info")
 
-        if not done or info is None:
-            return
+#         if not done or info is None:
+#             return
 
-        # Only collect at episode end.
-        if "dist_error" in info:
-            try:
-                self._dist_error_buffer.append(float(info["dist_error"]))
-            except Exception:
-                pass
+#         # Only collect at episode end.
+#         if "dist_error" in info:
+#             try:
+#                 self._dist_error_buffer.append(float(info["dist_error"]))
+#             except Exception:
+#                 pass
 
-        if "pred_accuracy" in info:
-            try:
-                self._pred_acc_buffer.append(float(info["pred_accuracy"]))
-            except Exception:
-                pass
+#         if "pred_accuracy" in info:
+#             try:
+#                 self._pred_acc_buffer.append(float(info["pred_accuracy"]))
+#             except Exception:
+#                 pass
 
-    def _on_step(self) -> bool:
-        # Reset buffers right before an evaluation happens (so they don't mix across evals).
-        # EvalCallback triggers evaluation inside super()._on_step().
-        self._dist_error_buffer = []
-        self._pred_acc_buffer = []
+#     def _on_step(self) -> bool:
+#         # Reset buffers right before an evaluation happens (so they don't mix across evals).
+#         # EvalCallback triggers evaluation inside super()._on_step().
+#         self._dist_error_buffer = []
+#         self._pred_acc_buffer = []
 
-        result = super()._on_step()
+#         result = super()._on_step()
 
-        # If an evaluation just happened, EvalCallback sets `self.last_mean_reward`.
-        # We can also log our aggregated means if buffers are non-empty.
-        if self.n_calls % self.eval_freq == 0:
-            if len(self._dist_error_buffer) > 0:
-                self.logger.record("eval/dist_error", float(np.mean(self._dist_error_buffer)))
-                self.logger.record("eval/dist_error_std", float(np.std(self._dist_error_buffer)))
+#         # If an evaluation just happened, EvalCallback sets `self.last_mean_reward`.
+#         # We can also log our aggregated means if buffers are non-empty.
+#         if self.n_calls % self.eval_freq == 0:
+#             if len(self._dist_error_buffer) > 0:
+#                 self.logger.record("eval/dist_error", float(np.mean(self._dist_error_buffer)))
+#                 self.logger.record("eval/dist_error_std", float(np.std(self._dist_error_buffer)))
 
-            if len(self._pred_acc_buffer) > 0:
-                self.logger.record("eval/pred_accuracy", float(np.mean(self._pred_acc_buffer)))
-                self.logger.record("eval/pred_accuracy_std", float(np.std(self._pred_acc_buffer)))
+#             if len(self._pred_acc_buffer) > 0:
+#                 self.logger.record("eval/pred_accuracy", float(np.mean(self._pred_acc_buffer)))
+#                 self.logger.record("eval/pred_accuracy_std", float(np.std(self._pred_acc_buffer)))
 
-        return result
+#         return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +129,17 @@ def parse_args() -> argparse.Namespace:
         default="val",
         help="CLRS split for eval env (train/val/test).",
     )
+    parser.add_argument(
+        "--load-model-path",
+        type=str,
+        default=None,
+        help="Path to an existing PPO .zip model to continue training from.",
+    )
+    parser.add_argument(
+        "--reset-num-timesteps",
+        action="store_true",
+        help="If set, reset timestep counter when continuing training. Default is to continue counting.",
+    )
 
     parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
@@ -151,10 +165,11 @@ def parse_args() -> argparse.Namespace:
 def _parse_nodes_csv(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
-def make_env_fn(args: argparse.Namespace, *, split: str, fixed_nodes: int, train_nodes: list[int], max_nodes: int):
+def make_env_fn(args: argparse.Namespace, *, split: str, fixed_nodes: int | None, train_nodes: list[int], max_nodes: int):
     def _make_env():
+        n_nodes_arg = int(fixed_nodes) if fixed_nodes is not None else int(train_nodes[0])
         env = BellmanFordEnv(
-            n_nodes=fixed_nodes,
+            n_nodes=n_nodes_arg,
             max_nodes=max_nodes,
             train_nodes=train_nodes,
             fixed_nodes=fixed_nodes,
@@ -163,7 +178,7 @@ def make_env_fn(args: argparse.Namespace, *, split: str, fixed_nodes: int, train
             use_clrs=not args.no_clrs,
             clrs_root=args.clrs_root,
             clrs_split=split,
-            clrs_num_nodes_list=sorted(set(train_nodes + [fixed_nodes])),
+            clrs_num_nodes_list=sorted(set(train_nodes + ([] if fixed_nodes is None else [fixed_nodes]))),
         )
         return env
     return _make_env
@@ -198,7 +213,7 @@ def main():
     train_env_fn = make_env_fn(
         args,
         split=args.clrs_train_split,
-        fixed_nodes=train_nodes[0],
+        fixed_nodes=None,
         train_nodes=train_nodes,
         max_nodes=max_nodes,
     )
@@ -230,21 +245,27 @@ def main():
         vec_env_kwargs={"start_method": "forkserver"},
     )
 
-    model = PPO(
-        "MultiInputPolicy",
-        env,
-        learning_rate=args.learning_rate,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
-        device=device,
-        verbose=1,
-    )
+    if args.load_model_path is not None:
+        print(f"[resume] loading model from {args.load_model_path}")
+        model = MaskablePPO.load(args.load_model_path, device=device)
+        model.set_env(env)
+        model.verbose = 1
+    else:
+        model = MaskablePPO(
+            "MultiInputPolicy",
+            env,
+            learning_rate=args.learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+            vf_coef=args.vf_coef,
+            device=device,
+            verbose=1,
+        )
 
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +281,7 @@ def main():
         save_vecnormalize=False,
     )
 
-    eval_callback = BellmanFordEvalCallback(
+    eval_callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(best_model_dir),
         log_path=str(run_dir / "eval"),
@@ -290,6 +311,7 @@ def main():
     model.learn(
         total_timesteps=args.total_timesteps,
         callback=[checkpoint_callback, eval_callback],
+        reset_num_timesteps=args.reset_num_timesteps,
     )
 
     model.save(str(run_dir / "final_model"))

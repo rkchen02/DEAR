@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
@@ -134,7 +137,8 @@ def eval_one_size(
 
     obs = vec.reset()
     while ep_done < episodes:
-        action, _ = model.predict(obs, deterministic=True)
+        action_masks = get_action_masks(vec)
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
         obs, rewards, dones, infos = vec.step(action)
         for done, info in zip(dones, infos):
             if not done:
@@ -156,7 +160,7 @@ def main() -> int:
     ap.add_argument("--model-path", type=str, default=None, help="Direct path to .zip model")
     ap.add_argument("--clrs-root", type=str, default=None)
     ap.add_argument("--clrs-split", type=str, default="val")
-    ap.add_argument("--max-nodes", type=int, default=64)
+    ap.add_argument("--max-nodes", type=int, default=None)
     ap.add_argument("--sizes", type=str, default="16,64")
     ap.add_argument("--episodes", type=int, default=200)
     ap.add_argument("--n-envs", type=int, default=8)
@@ -176,7 +180,22 @@ def main() -> int:
     torch.set_num_threads(max(1, min(4, slurm_cpus)))
     device = "cpu"
 
-    model = PPO.load(str(model_path), device=device)
+    model = MaskablePPO.load(str(model_path), device=device)
+
+    # Infer max_nodes from the model's discrete action space if not provided.
+    if args.max_nodes is None:
+        try:
+            n_actions = int(model.action_space.n) 
+        except Exception as e:
+            raise SystemExit(f"Could not infer max_nodes from model action space: {e!r}")
+        root = int(math.isqrt(n_actions))
+        if root * root != n_actions:
+            raise SystemExit(
+                f"Model action space n={n_actions} is not a perfect square; "
+                "cannot infer max_nodes. Please pass --max-nodes explicitly."
+            )
+        args.max_nodes = root
+        print(f"[eval] inferred --max-nodes {args.max_nodes} from model.action_space.n={n_actions}")
 
     sizes = [int(x.strip()) for x in args.sizes.split(",") if x.strip()]
     out_dir = Path(args.out_dir) if args.out_dir else model_path.parent
@@ -187,7 +206,7 @@ def main() -> int:
         res = eval_one_size(
             model=model,
             fixed_nodes=n,
-            max_nodes=args.max_nodes,
+            max_nodes=int(args.max_nodes),
             episodes=args.episodes,
             n_envs=args.n_envs,
             seed=args.seed + n * 1000,

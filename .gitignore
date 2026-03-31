@@ -4,5 +4,13 @@ data
 .DS_store
 wandb
 *.png
+.venv/
+venv/
+ENV/
+*.err
+*.out
+*.tar.gz
+*.sbatch
+runs/
 Miniconda3-latest-MacOSX-arm64.sh
 Miniconda3-latest-MacOSX-x86_64.sh

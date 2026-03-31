@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import time
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
+from envs.bellman_ford_env import BellmanFordEnv
+from gnarl_transfer.warmstart import warmstart_ppo_from_path
+
+
+class BellmanFordEvalCallback(EvalCallback):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dist_error_buffer = []
+        self._pred_acc_buffer = []
+
+    def _log_success_callback(self, locals_, globals_) -> None:
+        super()._log_success_callback(locals_, globals_)
+
+        done = locals_.get("done")
+        info = locals_.get("info")
+
+        if not done or info is None:
+            return
+
+        if "dist_error" in info:
+            self._dist_error_buffer.append(float(info["dist_error"]))
+        if "pred_accuracy" in info:
+            self._pred_acc_buffer.append(float(info["pred_accuracy"]))
+
+    def _on_step(self) -> bool:
+        self._dist_error_buffer = []
+        self._pred_acc_buffer = []
+
+        result = super()._on_step()
+
+        if self.n_calls % self.eval_freq == 0:
+            if self._dist_error_buffer:
+                self.logger.record("eval/dist_error", float(np.mean(self._dist_error_buffer)))
+                self.logger.record("eval/dist_error_std", float(np.std(self._dist_error_buffer)))
+            if self._pred_acc_buffer:
+                self.logger.record("eval/pred_accuracy", float(np.mean(self._pred_acc_buffer)))
+                self.logger.record("eval/pred_accuracy_std", float(np.std(self._pred_acc_buffer)))
+
+        return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Warm-start and fine-tune a PPO Bellman-Ford agent.")
+
+    parser.add_argument("--init-model-path", type=str, required=True)
+
+    parser.add_argument("--n-nodes", type=int, default=16)
+    parser.add_argument("--reward-mode", type=str, choices=["dense", "sparse"], default="sparse")
+
+    parser.add_argument("--max-nodes", type=int, default=None)
+    parser.add_argument("--train-nodes", type=str, default="16")
+    parser.add_argument("--eval-nodes", type=int, default=16)
+
+    parser.add_argument("--no-clrs", action="store_true")
+    parser.add_argument("--clrs-root", type=str, default=None)
+    parser.add_argument("--clrs-train-split", type=str, default="train")
+    parser.add_argument("--clrs-eval-split", type=str, default="val")
+
+    parser.add_argument("--n-envs", type=int, default=8)
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--seed", type=int, default=47)
+
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-range", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--n-steps", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--n-epochs", type=int, default=10)
+
+    parser.add_argument("--checkpoint-freq", type=int, default=100_000)
+    parser.add_argument("--eval-freq", type=int, default=10_000)
+    parser.add_argument("--run-name", type=str, default=None)
+
+    return parser.parse_args()
+
+
+def _parse_nodes_csv(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def make_env_fn(
+    args: argparse.Namespace,
+    *,
+    split: str,
+    fixed_nodes: int | None,
+    train_nodes: List[int],
+    max_nodes: int,
+):
+    def _make_env():
+        n_nodes_arg = int(fixed_nodes) if fixed_nodes is not None else int(train_nodes[0])
+        return BellmanFordEnv(
+            n_nodes=n_nodes_arg,
+            max_nodes=max_nodes,
+            train_nodes=train_nodes,
+            fixed_nodes=fixed_nodes,
+            reward_mode=args.reward_mode,
+            seed=None,
+            use_clrs=not args.no_clrs,
+            clrs_root=args.clrs_root,
+            clrs_split=split,
+            clrs_num_nodes_list=sorted(set(train_nodes + ([] if fixed_nodes is None else [fixed_nodes]))),
+        )
+    return _make_env
+
+
+def main() -> int:
+    args = parse_args()
+
+    train_nodes = _parse_nodes_csv(args.train_nodes)
+    eval_nodes = int(args.eval_nodes)
+    if args.max_nodes is None:
+        max_nodes = max(train_nodes + [eval_nodes, int(args.n_nodes)])
+    else:
+        max_nodes = int(args.max_nodes)
+
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+    torch_threads = 1 if torch.cuda.is_available() else max(1, min(4, slurm_cpus))
+    torch.set_num_threads(torch_threads)
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    run_id = args.run_name or time.strftime("%Y%m%d-%H%M%S")
+    run_dir = Path("runs") / "bf_ppo_finetune" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    train_env_fn = make_env_fn(
+        args,
+        split=args.clrs_train_split,
+        fixed_nodes=None,
+        train_nodes=train_nodes,
+        max_nodes=max_nodes,
+    )
+    eval_env_fn = make_env_fn(
+        args,
+        split=args.clrs_eval_split,
+        fixed_nodes=eval_nodes,
+        train_nodes=train_nodes,
+        max_nodes=max_nodes,
+    )
+
+    env = make_vec_env(
+        train_env_fn,
+        n_envs=args.n_envs,
+        seed=args.seed,
+        monitor_dir=str(run_dir / "monitor"),
+        vec_env_cls=SubprocVecEnv,
+        vec_env_kwargs={"start_method": "forkserver"},
+    )
+
+    eval_env = make_vec_env(
+        eval_env_fn,
+        n_envs=1,
+        seed=args.seed + 10_000,
+        monitor_dir=str(run_dir / "eval_monitor"),
+        vec_env_cls=SubprocVecEnv,
+        vec_env_kwargs={"start_method": "forkserver"},
+    )
+
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        learning_rate=args.learning_rate,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        device=device,
+        verbose=1,
+    )
+
+    warmstart_stats = warmstart_ppo_from_path(
+        model,
+        args.init_model_path,
+        device=device,
+    )
+    (run_dir / "warmstart_stats.json").write_text(json.dumps(warmstart_stats, indent=2))
+
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    best_model_dir = run_dir / "best_model"
+    best_model_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=args.checkpoint_freq,
+        save_path=str(checkpoint_dir),
+        name_prefix="bf_ppo_finetune",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
+    eval_callback = BellmanFordEvalCallback(
+        eval_env,
+        best_model_save_path=str(best_model_dir),
+        log_path=str(run_dir / "eval"),
+        eval_freq=args.eval_freq,
+        n_eval_episodes=20,
+        deterministic=True,
+        render=False,
+    )
+
+    def _handle_termination(signum, frame):
+        try:
+            model.save(str(run_dir / "emergency_model"))
+        finally:
+            try:
+                env.close()
+                eval_env.close()
+            except Exception:
+                pass
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGUSR1, _handle_termination)
+    signal.signal(signal.SIGTERM, _handle_termination)
+
+    model.learn(
+        total_timesteps=args.total_timesteps,
+        callback=[checkpoint_callback, eval_callback],
+        reset_num_timesteps=True,
+    )
+
+    model.save(str(run_dir / "final_model"))
+
+    (run_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "init_model_path": args.init_model_path,
+                "train_nodes": train_nodes,
+                "eval_nodes": eval_nodes,
+                "max_nodes": max_nodes,
+                "total_timesteps": args.total_timesteps,
+                "seed": args.seed,
+            },
+            indent=2,
+        )
+    )
+
+    env.close()
+    eval_env.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
