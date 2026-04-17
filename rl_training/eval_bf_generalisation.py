@@ -64,7 +64,7 @@ def _make_fixed_env(
             max_nodes=max_nodes,
             fixed_nodes=fixed_nodes,
             train_nodes=[fixed_nodes],
-            reward_mode="sparse",  # reward doesn’t matter for pure eval; keep consistent
+            reward_mode="sparse",
             seed=None,
             use_clrs=True,
             clrs_root=clrs_root,
@@ -143,7 +143,6 @@ def eval_one_size(
         for done, info in zip(dones, infos):
             if not done:
                 continue
-            # Expect env to attach metrics in info at termination.
             agg.add(info)
             ep_done += 1
             if ep_done >= episodes:
@@ -175,14 +174,12 @@ def main() -> int:
             raise SystemExit("Need either --model-path or --run-id")
         model_path = _resolve_model_path(args.run_id, args.which)
 
-    # CPU-only is fine (and avoids GPU contention). Keep threads modest.
     slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
     torch.set_num_threads(max(1, min(4, slurm_cpus)))
     device = "cpu"
 
     model = MaskablePPO.load(str(model_path), device=device)
 
-    # Infer max_nodes from the model's discrete action space if not provided.
     if args.max_nodes is None:
         try:
             n_actions = int(model.action_space.n) 
@@ -216,7 +213,6 @@ def main() -> int:
         results[str(n)] = res
         print(f"[eval] n={n} -> {res}")
 
-    # write json + csv
     (out_dir / "generalisation_results.json").write_text(json.dumps(results, indent=2))
 
     csv_lines = ["n,success_rate,success_rate_std,dist_error,dist_error_std,pred_accuracy,pred_accuracy_std"]

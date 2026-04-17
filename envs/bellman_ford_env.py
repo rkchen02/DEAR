@@ -11,11 +11,6 @@ import numpy as np
 class BellmanFordEnv(gym.Env):
     """
     Bellman–Ford environment for RL.
-
-    Optionally draws graphs from the CLRS / DEAR generators
-    (via the PyTorch Geometric dataset defined in datasets/clrs_datasets.py).
-
-    Key points:
     - State is the current distance estimates d, predecessors pi and a visited mask.
     - Action is choosing a directed edge (u, v) to relax.
     - Transition follows the usual Bellman–Ford relaxation rule.
@@ -105,11 +100,10 @@ class BellmanFordEnv(gym.Env):
 
         if self.use_clrs:
             try:
-                # Lazy import so that this file can still be used without CLRS.
-                from datasets.clrs_datasets import CLRS as CLRSData  # type: ignore
+                # Lazy import so that this file can still be used without CLRS
+                from datasets.clrs_datasets import CLRS as CLRSData  
 
                 if clrs_root is None:
-                    # Assume this file lives at <repo_root>/envs/bellman_ford_env.py
                     repo_root = os.path.abspath(
                         os.path.join(os.path.dirname(__file__), os.pardir)
                     )
@@ -161,10 +155,10 @@ class BellmanFordEnv(gym.Env):
                 self.use_clrs = False
 
         # --- Gym spaces -------------------------------------------------------
-        # Action: choose a directed edge (u, v).
+        # Action: choose a directed edge (u, v)
         self.action_space = spaces.Discrete(self.max_nodes * self.max_nodes)
 
-        # Observation: dict of numpy arrays.
+        # Observation: dict of numpy arrays
         self.observation_space = spaces.Dict(
             {
                 "t": spaces.Box(0, np.iinfo(np.int32).max, shape=(1,), dtype=np.int32),
@@ -177,21 +171,21 @@ class BellmanFordEnv(gym.Env):
         )
 
 
-        # Internal state placeholders (initialised in reset()).
-        self.W: Optional[np.ndarray] = None  # weight matrix [n, n], inf if no edge
-        self.edge_list = []  # list of (u, v) with an edge
+        # Internal state placeholders (initialised in reset())
+        self.W: Optional[np.ndarray] = None  
+        self.edge_list = []
         self.source: int = 0
         self.d: np.ndarray = np.full(self.max_nodes, np.inf, dtype=np.float32)
         self.pred: np.ndarray = -np.ones(self.max_nodes, dtype=np.int32)
         self.visited: np.ndarray = np.zeros(self.max_nodes, dtype=np.float32)
         self.t: int = 0
         self.phase: int = 1
-        self.max_steps: int = 0  # set after we know |E|
+        self.max_steps: int = 0
         self.opt_d: Optional[np.ndarray] = None
         self.opt_pred: Optional[np.ndarray] = None
         self.has_neg_cycle: bool = False
 
-    # ------------------------------------------------------------------ utils
+    # --- Utils ---------------------------------------------------------------
     def _empty_obs(self) -> Dict[str, Any]:
         return {
             "t": np.array([0], dtype=np.int32),
@@ -218,16 +212,12 @@ class BellmanFordEnv(gym.Env):
         data_num_nodes = int(data.num_nodes)
         n = min(data_num_nodes, self.max_nodes)
 
-        # CLRS graph representation (from datasets/clrs_datasets.py):
-        # - data.edge_index : LongTensor [2, E]
-        # - data.A          : FloatTensor [E] or [E, 1] with edge weights
         edge_index = data.edge_index.cpu().numpy()
         edge_attr = data.A.view(-1).cpu().numpy().astype(np.float32)
 
-        # Padded adjacency/weight matrix of fixed size (max_nodes x max_nodes).
+        # Padded adjacency/weight matrix of fixed size (max_nodes x max_nodes)
         W = np.full((self.max_nodes, self.max_nodes), np.inf, dtype=np.float32)
 
-        # Fill only edges that lie inside the first n nodes.
         for (u, v), w in zip(edge_index.T, edge_attr):
             u = int(u)
             v = int(v)
@@ -254,7 +244,6 @@ class BellmanFordEnv(gym.Env):
                         w = self.rng.uniform(0.0, self.max_weight)
                     W[u, v] = float(w)
 
-        # Ensure at least some edges.
         if not np.any(np.isfinite(W)):
             for u in range(n - 1):
                 W[u, u + 1] = self.rng.uniform(
@@ -282,7 +271,6 @@ class BellmanFordEnv(gym.Env):
         pred = -np.ones(n, dtype=np.int32)
         d[source] = 0.0
 
-        # |V| - 1 relaxation passes.
         for _ in range(n - 1):
             for u, v in self.edge_list:
                 w = self.W[u, v]
@@ -295,7 +283,6 @@ class BellmanFordEnv(gym.Env):
                     d[v] = new_d
                     pred[v] = u
 
-        # Negative cycle detection.
         has_neg_cycle = False
         for u, v in self.edge_list:
             w = self.W[u, v]
@@ -320,7 +307,6 @@ class BellmanFordEnv(gym.Env):
         return out
 
     def _get_obs(self) -> Dict[str, Any]:
-        # Always return fixed-size tensors that match observation_space.
         d = self._pad_1d(self.d, fill=np.inf, dtype=np.float32)
         D_INF = np.float32(1e6)
         d = np.where(np.isinf(d), D_INF, d).astype(np.float32)
@@ -380,37 +366,29 @@ class BellmanFordEnv(gym.Env):
         if seed is not None:
             self.rng.seed(seed)
 
-        # Sample graph (CLRS if available, else random).
+        # Sample graph (CLRS if available, else random)
         if self.use_clrs and self._clrs_datasets:
             chosen_n = int(self.fixed_nodes) if self.fixed_nodes is not None else int(random.choice(self.train_nodes))
             self.W, self.current_n_nodes = self._graph_from_clrs_sample(chosen_n)
         else:
             self.W, self.current_n_nodes = self._graph_random()
 
-        # Build edge list & classical BF ground truth.
+        # Build edge list & classical BF ground truth
         self._build_edge_list()
         num_edges = len(self.edge_list)
         if num_edges == 0:
             raise RuntimeError("Graph has no edges; this should not happen.")
 
-        # Horizon matches classical CLRS Bellman–Ford: (|V| - 1) * |E|.
         self.max_steps = max(1, (self.current_n_nodes - 1) * num_edges)
-
-        # Sample a source node.
         self.source = int(self.rng.randint(self.current_n_nodes))
-
-        # Initialise distances / predecessors.
         self.d = np.full(self.max_nodes, np.inf, dtype=np.float32)
         self.pred = np.full(self.max_nodes, -1, dtype=np.int32)
         self.visited = np.zeros(self.max_nodes, dtype=np.float32)
         self.d[self.source] = 0.0
         self.visited[:] = 0.0
         self.visited[self.source] = 1.0
-
         self.t = 0
         self.phase = 1
-
-        # Ground-truth Bellman–Ford solution for metrics / shaping.
         self.opt_d, self.opt_pred, self.has_neg_cycle = self._bellman_ford_ground_truth(
             self.source
         )
@@ -451,7 +429,6 @@ class BellmanFordEnv(gym.Env):
                 self.visited[v] = 1.0
                 if self.reward_mode == "dense":
                     reward = 1.0
-        # else: no-op; dense gives 0, sparse gives 0 (until terminal bonus)
 
         self.t += 1
 
@@ -548,7 +525,6 @@ class BellmanFordEnv(gym.Env):
         }
 
     def render(self):
-        """Pretty-print the current state (for debugging)."""
         print(f"t = {self.t}, phase p = {self.phase}")
         print(f"source = {self.source}")
         print("Distances d:", self.d)

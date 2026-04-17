@@ -12,13 +12,12 @@ from .types import PathLike, RunPaths
 from .utils import ensure_dir, now_compact_local, safe_git_commit, slurm_cpus_per_task, write_json
 from .io import save_policy
 
-EnvFactory = Callable[[str], Any]  # takes clrs_split -> env
-EvalCallbackFactory = Callable[[Any, RunPaths, int], Any]  # (eval_env, paths, eval_freq) -> callback
+EnvFactory = Callable[[str], Any]
+EvalCallbackFactory = Callable[[Any, RunPaths, int], Any]
 
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    # task/env
     n_nodes: int = 16
     reward_mode: str = "sparse"
     use_clrs: bool = True
@@ -26,7 +25,6 @@ class RunnerConfig:
     clrs_train_split: str = "train"
     clrs_eval_split: str = "val"
 
-    # sb3 training
     n_envs: int = 8
     total_timesteps: int = 1_000_000
     seed: int = 47
@@ -74,7 +72,6 @@ class ExperimentRunner:
         ensure_dir(root)
         paths = RunPaths(root=root)
 
-        # Ensure expected subdirs exist
         ensure_dir(paths.checkpoints_dir)
         ensure_dir(paths.best_model_dir)
         ensure_dir(paths.monitor_dir)
@@ -84,7 +81,6 @@ class ExperimentRunner:
         return paths
 
     def _set_seeds_and_threads(self, cfg: RunnerConfig) -> str:
-        # Threading: similar to your existing logic
         slurm_cpus = slurm_cpus_per_task(default=1)
         torch_threads = 1 if torch.cuda.is_available() else max(1, min(4, slurm_cpus))
         torch.set_num_threads(torch_threads)
@@ -98,7 +94,6 @@ class ExperimentRunner:
         paths = self._make_run_dir(cfg)
         device = self._set_seeds_and_threads(cfg)
 
-        # Persist config + metadata early (helps even if job is preempted)
         write_json(paths.config_file, asdict(cfg))
         write_json(
             paths.metadata_file,
@@ -110,13 +105,12 @@ class ExperimentRunner:
             },
         )
 
-        # Lazy imports to keep module importable without SB3
+        # Lazy imports 
         from stable_baselines3 import PPO
         from stable_baselines3.common.env_util import make_vec_env
         from stable_baselines3.common.callbacks import CheckpointCallback
         from stable_baselines3.common.vec_env import SubprocVecEnv
 
-        # Build vec envs (matches your current setup)
         env = make_vec_env(
             lambda: self.env_factory(cfg, cfg.clrs_train_split),
             n_envs=cfg.n_envs,
@@ -151,7 +145,6 @@ class ExperimentRunner:
             verbose=1,
         )
 
-        # Default checkpoint callback, unless user provides a factory
         if self.checkpoint_callback_factory is not None:
             checkpoint_cb = self.checkpoint_callback_factory(paths, cfg.checkpoint_freq)
         else:
@@ -165,7 +158,6 @@ class ExperimentRunner:
 
         callbacks = [checkpoint_cb]
 
-        # Eval callback (use your custom one if provided)
         if self.eval_callback_factory is not None:
             eval_cb = self.eval_callback_factory(eval_env, paths, cfg.eval_freq)
         else:
@@ -183,12 +175,10 @@ class ExperimentRunner:
 
         callbacks.append(eval_cb)
 
-        # Signal handling (as in your script)
         def _handle_termination(signum, frame):
             print(f"[signal] received {signum}; saving emergency checkpoint...")
             try:
                 model.save(str(paths.root / "emergency_model"))
-                # normalise naming
                 em = paths.root / "emergency_model.zip"
                 if not em.exists():
                     alt = paths.root / "emergency_model"
@@ -212,7 +202,6 @@ class ExperimentRunner:
             callback=callbacks,
         )
 
-        # Save final model via library I/O
         save_policy(
             paths.root,
             model,

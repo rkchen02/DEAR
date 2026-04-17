@@ -27,7 +27,6 @@ def evaluate_model(model, n_nodes_list, n_eval_episodes=10):
                 obs, reward, done, _, info = env.step(action)
                 total_reward += reward
 
-            # Compute CLRS-style metrics from the environment
             metrics = env.compute_metrics()
             distance_accs.append(metrics["distance_accuracy"])
             pointer_accs.append(metrics["pointer_accuracy"])

@@ -51,10 +51,6 @@ def collect_bf_expert_data(
     """
     Collect expert trajectories by executing the environment's canonical
     Bellman-Ford teacher policy.
-
-    The environment is expected to expose:
-      - get_expert_action()
-      - standard Gymnasium reset() and step()
     """
     if episodes <= 0:
         raise ValueError("episodes must be positive")

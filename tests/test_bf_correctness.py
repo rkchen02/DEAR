@@ -18,13 +18,11 @@ def classical_bellman_ford_numpy(W: np.ndarray, source: int, eps: float = 1e-6):
 
     d[source] = 0.0
 
-    # Build edge list (u, v) where W[u, v] is finite
     edges = [(int(u), int(v))
              for u in range(n)
              for v in range(n)
              if np.isfinite(W[u, v])]
 
-    # n - 1 relaxation passes
     for _ in range(n - 1):
         updated = False
         for (u, v) in edges:
@@ -39,7 +37,6 @@ def classical_bellman_ford_numpy(W: np.ndarray, source: int, eps: float = 1e-6):
         if not updated:
             break
 
-    # One more pass to detect negative cycles
     has_neg_cycle = False
     for (u, v) in edges:
         w = W[u, v]
@@ -53,11 +50,6 @@ def classical_bellman_ford_numpy(W: np.ndarray, source: int, eps: float = 1e-6):
 
 
 def make_env_for_correctness(n_nodes: int, seed: int) -> BellmanFordEnv:
-    """
-    We:
-      - disable CLRS graphs (use_clrs=False) to avoid any JAX / TF baggage
-      - disable negative weights so there are no negative cycles
-    """
     env = BellmanFordEnv(
         n_nodes=n_nodes,
         seed=seed,
@@ -72,24 +64,17 @@ def make_env_for_correctness(n_nodes: int, seed: int) -> BellmanFordEnv:
 def run_expert_policy(env: BellmanFordEnv):
     """
     Reset the env and then apply the classical Bellman–Ford relaxation
-    schedule:
-        for pass in range(n_nodes - 1):
-            for (u, v) in edges:
-                relax edge (u, v)
-    using env.step([...]) as the relaxation primitive.
+    schedule
     """
     obs, info = env.reset()
 
     n = env.n_nodes
-    # env.edge_list is already a list of (u, v) pairs where W[u, v] is finite
     edges = list(env.edge_list)
 
     for _ in range(n - 1):
         for (u, v) in edges:
             action = np.array([u, v], dtype=np.int64)
             obs, reward, terminated, truncated, info = env.step(action)
-            # We don't *expect* termination early (horizon is quite large),
-            # but if someone ever adds a smarter termination, this keeps us safe.
             if terminated or truncated:
                 return obs
 
@@ -103,7 +88,6 @@ def assert_same_solution(W: np.ndarray, source: int, obs, eps: float = 1e-5):
     """
     d_star, pred_star, has_neg_cycle = classical_bellman_ford_numpy(W, source)
 
-    # By construction (allow_negative_weights=False) there should be no neg cycles
     assert not has_neg_cycle, "Test graph unexpectedly has a negative cycle."
 
     d_env = np.asarray(obs["d"], dtype=np.float64)
@@ -115,12 +99,9 @@ def assert_same_solution(W: np.ndarray, source: int, obs, eps: float = 1e-5):
     n = d_star.shape[0]
 
     for i in range(n):
-        # Distances: handle infinities carefully
         if not np.isfinite(d_star[i]) and not np.isfinite(d_env[i]):
-            # Both +inf -> unreachable, that's fine
             continue
 
-        # If classical says reachable, env must also say reachable
         assert np.isfinite(d_star[i]), f"Ground-truth d[{i}] is inf unexpectedly."
         assert np.isfinite(d_env[i]), f"Env d[{i}] is inf but GT is {d_star[i]}."
 
@@ -130,7 +111,6 @@ def assert_same_solution(W: np.ndarray, source: int, obs, eps: float = 1e-5):
             f"env={d_env[i]}, gt={d_star[i]}, |diff|={diff}"
         )
 
-        # Predecessors: only meaningful for reachable non-source nodes
         if i == source:
             continue
         if not np.isfinite(d_star[i]):
@@ -153,7 +133,6 @@ def test_bellman_ford_matches_classical():
         env = make_env_for_correctness(n_nodes=n_nodes, seed=seed)
         obs_final = run_expert_policy(env)
 
-        # Compare env result vs classical Bellman–Ford
         assert_same_solution(env.W, env.source, obs_final)
 
         print(

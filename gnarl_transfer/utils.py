@@ -27,9 +27,6 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 
 def safe_git_commit() -> Optional[str]:
-    """
-    Best-effort: return current git commit hash if available, else None.
-    """
     import subprocess
 
     try:
